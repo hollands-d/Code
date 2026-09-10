@@ -2066,3 +2066,93 @@ A new **Shock analysis** tab is placed immediately after **Raw comparison**. It 
 - Selecting Applied shock axis chooses the X-, Y- or Z-applied test to review.
 - When baseline and reader shock captures are both loaded for the selected axis, their Delta-X/Delta-Y/Delta-Z and resultant traces are overlaid and aligned to their respective peak shock for comparison.
 - Summary reports reader peak, dominant measured axis, grouped physical event count, baseline peak and Reader/Baseline peak ratio.
+
+## v38 live threshold display update
+
+The `Live threshold` tab now uses one combined X/Y/Z Gordon-band graph in Issue 2 mode, with the same axis colours used elsewhere in the application (X blue, Y orange, Z green). When live K correction is enabled and a complete 42-coefficient set is loaded, the graph shows the raw reader traces as faint dashed references and the K-corrected X/Y/Z traces as solid lines against the configured threshold. The threshold decision/status is calculated from the same corrected values shown on the graph. When K correction is disabled, the graph shows the raw X/Y/Z values against the threshold. Issue 1 behaviour is unchanged.
+
+
+## v39 terminology update
+- Live K and Live threshold legends now use **translated** for values after applying Base/Reader K.
+- Raw reader traces remain labelled **raw**.
+- Threshold status/title text uses **translated** when live K correction is active.
+
+## v40 - characterisation workflow alignment
+
+- Restored the horizontally scrollable tab strip with left/right controls so engineering tab labels remain readable.
+- Restored the dedicated **Shock summary** tab with X/Y/Z applied-shock rows and added **Export shock results** (CSV + settings JSON).
+- Added **Store driven-axis K** so an approved X-, Y- or Z-excited run can be retained independently.
+- Added **Export final XYZ K** to assemble the final 42 coefficients from three separately stored driven-axis results with source traceability.
+- The existing **Export derived correction** remains available as a diagnostic export from the currently loaded reader dataset.
+- Updated application title to v40 and aligned help wording with translated live K terminology.
+
+
+### Test-house baseline/reference files
+
+Use **Load baseline/reference file(s)** to open CSV or Excel `.xlsx` files.
+Integrated Technologies paired Hz/magnitude tables use **Ctl**, the measured
+control accelerometer PSD, as the physical input for Issue 2 Gordon-band K.
+**Ref** is the commanded target and does not contribute to K. Other test-house
+fields, including alarm and CA channels, are ignored and are not displayed. Ref is retained for diagnostic display only and is never used to derive K.
+
+Lateral files populate both X and Y; Vertical files populate Z. Ambiguous
+test-house filenames prompt for orientation. Existing simple PSD CSV and
+time-domain CSV formats remain supported. Excel loading requires `openpyxl`
+(included in `requirements.txt`).
+
+The PSD comparison tab displays baseline curves immediately, without a reader
+capture or K calculation. Each source has its own plot with logarithmic PSD
+scaling and labelled Ctl/Ref curves. Reader data subsequently
+overlays the mapped axes without changing the source. The source summary shows
+orientation, Ctl selection, available curves, coverage and reader availability.
+
+PSD-only sources support Gordon bands, K derivation, translation and correction
+export. They cannot provide time overlays, synchronous phase, H1 or coherence.
+Truncated band coverage produces a warning and retains existing integration
+behaviour without extrapolation. Export settings record baseline type, source,
+orientation, mapping, frequency range and shared lateral usage.
+
+
+### Reader Excel workbooks
+
+**Load reader CSV/XLSX** also accepts the Integrated Technologies workbooks.
+Only **Ctl** is imported as the reader's measured PSD; Ref, alarm and CA fields
+are ignored. Vertical files represent Z; for Lateral files choose whether the
+measurement represents reader X or Y. A single reader PSD is never duplicated
+across axes as correction evidence.
+
+Reader Ctl overlays the baseline/reference PSD without changing the baseline.
+Issue 2 Gordon-band comparison, translation and K export use the existing
+integration, with K = baseline RMS / reader RMS. A single-axis PSD export contains
+14 coefficients for that axis; use Store driven-axis K and Export final XYZ K
+when assembling separate X/Y/Z runs. Export settings identify the reader file,
+worksheet, Ctl source, frequency range and selected axis.
+
+PSD workbooks do not contain time samples, so time-domain overlays, Issue 1 FFT,
+phase, H1 and coherence are unavailable. Existing reader CSV loading remains
+supported, as do Excel sheets containing the equivalent reader sample columns.
+
+## September 2026 translation-workflow completion
+
+The characterisation workflow now uses a common driven-axis translation model for both processing methods.
+
+- Reference input supports time-domain CSV/XLSX and PSD CSV/XLSX. Integrated Technologies baseline tables retain measured `Ctl` for calculations and retain `Ref` for diagnostic display only; Alarm and CA curves are ignored.
+- Lateral references can be assigned to X, Y or X+Y using the sidebar selector; explicit X/Y filename tokens take precedence.
+- X-, Y- and Z-excited reader captures are retained independently. Only the deliberately driven axis can create a primary translation; orthogonal channels remain diagnostic.
+- Issue 2 produces the existing 14 Gordon-band `K = reference / reader` factors per axis.
+- Issue 1 now produces an exportable per-FFT-bin translation. PSD-only references are converted directly to the equivalent Issue-1 Fourier-bin amplitude by integrating PSD over each 1.5625 Hz FFT bin, with the Issue-1 FIR magnitude-squared response applied. No synthetic time history is created.
+- The same store/final-XYZ-export workflow is used for Issue 1 and Issue 2, and mixed-method XYZ sets are rejected.
+- Live translation loading is method-aware. Issue 1 factors are applied to Issue-1 ensemble amplitudes; Issue 2 factors are applied after Gordon-band integration. A method mismatch prevents live translation from being enabled.
+- Live displays use `translated environmental estimate` terminology and retain raw reader data unchanged.
+
+Regression suite: 25 tests passing under xvfb, including coverage for time-domain XLSX references, Ctl-authoritative/Ref-diagnostic parsing, independent reader slots, driven-axis-only translation, Issue-1 PSD conversion, Issue-1 storage, and mixed-method rejection.
+
+
+## v42 - restore test-house Ref diagnostic display
+
+- Integrated Technologies baseline/reference imports retain both `Ctl` and `Ref` for plotting.
+- `Ctl` remains the sole authoritative baseline used for Issue 1/Issue 2 translation calculations.
+- `Ref` is diagnostic/display-only and cannot influence K.
+- Alarm and CA channels remain discarded.
+- Reader PSD imports remain Ctl-only.
+- Regression suite remains 25/25 passing.

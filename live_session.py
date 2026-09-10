@@ -7,6 +7,8 @@ import threading
 
 @dataclass(frozen=True)
 class OperatorTimeoutConfig:
+    """User-facing capture limit; independent of the firmware stream lease."""
+
     enabled: bool = True
     duration_s: float = 300.0
     action: str = "Ask"
@@ -20,6 +22,14 @@ class OperatorTimeoutConfig:
 
 @dataclass
 class LiveSessionState:
+    """Thread-safe scheduler state for a live acquisition session.
+
+    Times are monotonic-clock values rather than wall-clock timestamps, so a
+    system clock adjustment cannot prematurely expire or extend a capture.
+    ``due_actions`` only reports work; the GUI/worker remains responsible for
+    carrying out the serial command or prompting the operator.
+    """
+
     operator: OperatorTimeoutConfig
     vmm_start_timeout_ms: int = 300_000
     vmm_renew_fraction: float = 0.8
@@ -39,6 +49,7 @@ class LiveSessionState:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def start(self, now: float) -> None:
+        """Reset all deadlines and counters for a session beginning at ``now``."""
         self.operator.validate()
         if self.vmm_start_timeout_ms <= 0:
             raise ValueError("VMM START timeout must be finite and greater than zero.")
@@ -61,9 +72,11 @@ class LiveSessionState:
             self.recovery_failed = False
 
     def _renew_interval_s(self) -> float:
+        """Renew before the finite firmware lease reaches its hard deadline."""
         return self.vmm_start_timeout_ms / 1000.0 * self.vmm_renew_fraction
 
     def record_sample(self, now: float) -> bool:
+        """Record stream progress and report whether this ends a stalled state."""
         with self._lock:
             recovered = self.stalled
             self.last_sample_block_monotonic = now
@@ -72,6 +85,11 @@ class LiveSessionState:
             return recovered
 
     def due_actions(self, now: float, stall_after_s: float) -> list[str]:
+        """Return scheduler actions that became due at ``now``.
+
+        A due condition is advanced or latched before returning, which makes
+        repeated polling idempotent until the next deadline.
+        """
         actions: list[str] = []
         with self._lock:
             if now >= self.next_vmm_renewal_monotonic:
@@ -105,28 +123,33 @@ class LiveSessionState:
         return actions
 
     def mark_vmm_renewal(self, now: float) -> None:
+        """Record a successfully issued lease renewal and restart its timer."""
         with self._lock:
             self.stream_renewals += 1
             self.next_vmm_renewal_monotonic = now + self._renew_interval_s()
 
     def continue_same_duration(self, now: float) -> None:
+        """Resolve an operator prompt by starting another equal capture period."""
         with self._lock:
             self.timeout_prompt_pending = False
             self.operator_deadline = now + self.operator.duration_s
             self.timeout_extensions += 1
 
     def continue_indefinitely(self) -> None:
+        """Resolve an operator prompt by disabling future operator deadlines."""
         with self._lock:
             self.timeout_prompt_pending = False
             self.operator_indefinite = True
             self.operator_deadline = None
 
     def cancel_prompt_for_stop(self) -> None:
+        """Resolve an operator prompt when capture is being stopped."""
         with self._lock:
             self.timeout_prompt_pending = False
             self.operator_deadline = None
 
     def snapshot(self, now: float) -> dict[str, float | int | bool | None]:
+        """Return a consistent diagnostics snapshot without exposing mutable state."""
         with self._lock:
             return {
                 "elapsed_s": max(0.0, now - self.started_monotonic),

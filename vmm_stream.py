@@ -37,12 +37,16 @@ CFG_FLAG_INT1_FIFO_TH = 0x08
 CFG_FLAG_EXTENDED_VALID = 0x80
 CONFIG_STRUCT = struct.Struct("<HBBIHHHHffffff")
 
+# Frames are COBS encoded so zero can be used as an unambiguous serial-frame
+# delimiter. A little-endian CRC32 is appended before COBS encoding.
+
 
 def _crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
 def _cobs_encode(data: bytes) -> bytes:
+    """Encode arbitrary bytes using Consistent Overhead Byte Stuffing."""
     if not data:
         return b"\x01"
     out = bytearray([0])
@@ -67,6 +71,7 @@ def _cobs_encode(data: bytes) -> bytes:
 
 
 def _cobs_decode(data: bytes) -> bytes:
+    """Reverse COBS encoding, rejecting malformed length codes."""
     if not data:
         return b""
     out = bytearray()
@@ -88,10 +93,12 @@ def _cobs_decode(data: bytes) -> bytes:
 
 
 def _pack_frame(packet: bytes) -> bytes:
+    """Add integrity protection, COBS encoding, and the zero frame delimiter."""
     return _cobs_encode(packet + struct.pack("<I", _crc32(packet))) + b"\x00"
 
 
 def _host_cmd(cmd: int, args: bytes = b"", seq: int = 0) -> bytes:
+    """Build a complete protocol-v1 host-command frame."""
     payload = struct.pack("<BBH", cmd & 0xFF, len(args) & 0xFF, 0) + args
     hdr = struct.pack(
         "<BBBBHH",
@@ -107,6 +114,8 @@ def _host_cmd(cmd: int, args: bytes = b"", seq: int = 0) -> bytes:
 
 @dataclass
 class SampleBlock:
+    """One timestamped FIFO block of raw signed X/Y/Z accelerometer counts."""
+
     seq: int
     timestamp_us: int
     sample_period_us: int
@@ -144,6 +153,7 @@ class AccelerometerConfig:
 
     @property
     def flags(self) -> int:
+        """Pack boolean and bandwidth settings into the firmware flag byte."""
         self.validate()
         bw_code = {2: 0, 4: 1, 8: 2, 16: 3}[self.bandwidth_divisor]
         flags = CFG_FLAG_EXTENDED_VALID | (bw_code << CFG_FLAG_BW_SHIFT)
@@ -154,6 +164,9 @@ class AccelerometerConfig:
         return flags
 
     def payload_bytes(self) -> bytes:
+        """Serialize the complete CONFIG payload expected by protocol v1."""
+        # Reserved/calibration fields retain identity defaults. Keeping them in
+        # the payload makes this client binary-compatible with the full struct.
         return CONFIG_STRUCT.pack(
             self.odr_hz,
             self.fs_g,
@@ -173,6 +186,7 @@ class AccelerometerConfig:
 
     @classmethod
     def from_payload(cls, payload: bytes) -> "AccelerometerConfig":
+        """Parse and validate the effective CONFIG echoed by the firmware."""
         if len(payload) < CONFIG_STRUCT.size:
             raise ValueError("CONFIG payload truncated")
         values = CONFIG_STRUCT.unpack_from(payload)
@@ -195,6 +209,8 @@ class AccelerometerConfig:
 
 @dataclass
 class StreamStats:
+    """Cumulative link diagnostics updated while packets are polled."""
+
     bytes_rx: int = 0
     frames_ok: int = 0
     frames_bad: int = 0
@@ -263,6 +279,7 @@ class VmmStreamClient:
         self._ser.flush()
 
     def _decode_packet(self, packet: bytes) -> Optional[object]:
+        """Decode a validated wire packet into an ACK, config, or sample block."""
         if len(packet) < 8:
             return None
         sync, ver, ptype, _r, _seq, plen = struct.unpack_from("<BBBBHH", packet)
@@ -305,6 +322,12 @@ class VmmStreamClient:
         return None
 
     def poll(self) -> List[object]:
+        """Consume all currently available complete serial frames.
+
+        Partial trailing data remains in ``_buf`` for the next poll. A corrupt
+        frame is counted and discarded without preventing later frames from
+        being decoded.
+        """
         chunk = self._ser.read(4096)
         if chunk:
             self.stats.bytes_rx += len(chunk)
@@ -337,6 +360,7 @@ class VmmStreamClient:
         return out
 
     def drain_for(self, duration_s: float) -> Iterator[object]:
+        """Yield packets arriving during a bounded interval."""
         t_end = time.monotonic() + duration_s
         while time.monotonic() < t_end:
             for pkt in self.poll():

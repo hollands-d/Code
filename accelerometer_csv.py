@@ -14,6 +14,8 @@ RAW_COUNT_COLUMNS = ("x_counts", "y_counts", "z_counts")
 
 @dataclass
 class DatasetMetadata:
+    """Provenance and data-quality findings collected during normalisation."""
+
     source_format: str
     reported_fs_g: tuple[float, ...] = ()
     reported_odr_hz: tuple[float, ...] = ()
@@ -28,10 +30,12 @@ class DatasetMetadata:
 
 
 def _column_lookup(columns: Iterable[object]) -> dict[str, object]:
+    """Map normalised column names back to their original DataFrame labels."""
     return {str(column).strip().lower(): column for column in columns}
 
 
 def detect_csv_format(df: pd.DataFrame) -> str:
+    """Distinguish lossless VMM count logs from already-converted g data."""
     low = _column_lookup(df.columns)
     if all(name in low for name in RAW_COUNT_COLUMNS):
         return "raw_vmm_counts"
@@ -39,6 +43,7 @@ def detect_csv_format(df: pd.DataFrame) -> str:
 
 
 def _find_column(df: pd.DataFrame, aliases: Iterable[str]):
+    """Prefer an exact alias, then accept an alias embedded in a longer label."""
     columns = list(df.columns)
     low = _column_lookup(columns)
     for alias in aliases:
@@ -52,6 +57,7 @@ def _find_column(df: pd.DataFrame, aliases: Iterable[str]):
 
 
 def _numeric(df: pd.DataFrame, column, label: str) -> np.ndarray:
+    """Convert a required column to finite floats, reporting bad row counts."""
     values = pd.to_numeric(df[column], errors="coerce").to_numpy(float)
     if not np.all(np.isfinite(values)):
         bad = int(np.sum(~np.isfinite(values)))
@@ -60,12 +66,14 @@ def _numeric(df: pd.DataFrame, column, label: str) -> np.ndarray:
 
 
 def _positive_unique(values: np.ndarray, label: str) -> tuple[float, ...]:
+    """Validate a positive configuration column and return its distinct values."""
     if not np.all(np.isfinite(values)) or np.any(values <= 0):
         raise ValueError(f"Invalid {label}: values must be finite and greater than zero.")
     return tuple(float(value) for value in np.unique(values))
 
 
 def _gap_count(timestamps_s: np.ndarray, expected_period_s: np.ndarray | None) -> int:
+    """Count non-monotonic or unexpectedly spaced adjacent timestamps."""
     if len(timestamps_s) < 2:
         return 0
     spacing = np.diff(timestamps_s)
@@ -75,11 +83,14 @@ def _gap_count(timestamps_s: np.ndarray, expected_period_s: np.ndarray | None) -
         expected = expected_period_s[:-1]
     else:
         expected = np.full(len(spacing), float(np.median(spacing)))
+    # Allow both proportional timing jitter and a small absolute clock/rounding
+    # error. The larger tolerance applies independently to each sample.
     tolerance = np.maximum(expected * 0.5, 2e-6)
     return int(np.sum(np.abs(spacing - expected) > tolerance))
 
 
 def _normalize_converted(df: pd.DataFrame, fallback_fs: float):
+    """Normalise a CSV whose acceleration channels are already expressed in g."""
     time_col = _find_column(df, ("time_s", "time", "timestamp"))
     axis_cols = {
         "X_g": _find_column(df, ("x_g", "accel_x", "acc_x")),
@@ -94,6 +105,8 @@ def _normalize_converted(df: pd.DataFrame, fallback_fs: float):
     if time_col is not None:
         time_s = _numeric(df, time_col, "time")
         time_s = time_s - time_s[0] if len(time_s) else time_s
+        # Estimate the rate robustly from positive intervals; duplicated or
+        # reversed timestamps do not participate in the median.
         positive = np.diff(time_s)
         positive = positive[np.isfinite(positive) & (positive > 0)]
         sample_rate = 1.0 / float(np.median(positive)) if len(positive) else float(fallback_fs)
@@ -109,6 +122,7 @@ def _normalize_converted(df: pd.DataFrame, fallback_fs: float):
 
 
 def _normalize_raw_vmm(df: pd.DataFrame, fallback_fs: float):
+    """Convert VMM int16 counts row by row while preserving timing metadata."""
     low = _column_lookup(df.columns)
     counts = {name: _numeric(df, low[name], name) for name in RAW_COUNT_COLUMNS}
     if "fs_g" not in low:
@@ -126,6 +140,8 @@ def _normalize_raw_vmm(df: pd.DataFrame, fallback_fs: float):
     if periods_us is not None:
         _positive_unique(periods_us, "sample_period_us")
 
+    # Timing sources are ordered from most to least authoritative: explicit
+    # sample timestamps, per-row periods, reported ODR, then the caller fallback.
     if "sample_timestamp_us" in low:
         timestamps_us = _numeric(df, low["sample_timestamp_us"], "sample_timestamp_us")
         time_s = (timestamps_us - timestamps_us[0]) / 1_000_000.0
@@ -161,6 +177,8 @@ def _normalize_raw_vmm(df: pd.DataFrame, fallback_fs: float):
     if gap_count:
         warnings.append(f"{gap_count} timestamp gap(s)")
 
+    # Signed int16 uses 32768 counts across either half of the configured range.
+    # Apply the scale per row because firmware may change full scale mid-capture.
     scale = fs_g / 32768.0
     canonical = pd.DataFrame({
         "time_s": time_s,

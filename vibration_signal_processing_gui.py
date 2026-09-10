@@ -1,9 +1,21 @@
-"""1174 Vibration Signal Processing Explorer - paired reference/reader edition."""
+"""1174 Vibration Signal Processing Explorer - paired reference/reader edition.
+
+The module contains three layers kept together for this standalone engineering
+tool:
+
+* CSV import and canonicalisation into time plus X/Y/Z acceleration in g;
+* reusable numerical processing in :class:`Processor` and :class:`PairAnalysis`;
+* the Tkinter :class:`App`, which coordinates offline analysis and a background
+  VMM serial-capture worker.
+
+Live serial work never updates Tk widgets directly. It places events on
+``live_queue`` and the Tk main thread consumes them from ``_poll_live_queue``.
+"""
 from __future__ import annotations
 import csv, json, math, re, tkinter as tk
 import queue, threading, time
 from tkinter import ttk, filedialog, messagebox, simpledialog
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -15,6 +27,12 @@ from matplotlib.patches import Circle
 
 from vmm_stream import (
     CMD_CONFIGURE, DEFAULT_BAUD, AccelerometerConfig, SampleBlock, VmmStreamClient,
+)
+from issue1_processing import (
+    ISSUE1_ENSEMBLE_COUNT, ISSUE1_FFT_N, ISSUE1_HIGH_HZ, ISSUE1_LOW_HZ,
+    ISSUE1_OVERLAP, ISSUE1_SAMPLE_RATE_HZ, Issue1Result, issue1_amplitude_from_psd,
+    issue1_ensemble_fft,
+    issue1_required_samples,
 )
 
 
@@ -157,9 +175,11 @@ class ScrollableFrame(ttk.Frame):
             self._canvas.unbind_all(seq)
 
 
-APP_TITLE="1174 Vibration Signal Processing Explorer — VMM stream v35"
+APP_TITLE="1174 Vibration Signal Processing Explorer — VMM stream v42"
 G0=9.80665
 DEFAULT_FS=200.0; DEFAULT_N=512; DEFAULT_OVERLAP=0.5; DEFAULT_WELCH_SEGMENTS=4
+ISSUE2_METHOD='Issue 2 – PSD / Gordon bands'
+ISSUE1_METHOD='Issue 1 – FFT ensemble'
 GORDON_FC=np.array([4.0,5.0,6.3,8.0,10.0,12.5,16.0,20.0,25.0,31.5,40.0,50.0,63.0,80.0],float)
 OCT_EDGE=2**(1/6)
 
@@ -186,23 +206,33 @@ def set_gordon_xaxis(ax, rotate=45):
 
 
 def gordon_office_velocity_um_s(fc):
+    """Return the Gordon office criterion as RMS velocity at each band centre."""
+    # Below 8 Hz the criterion is constant acceleration; from 8 Hz upward it is
+    # constant velocity (400 um/s). Convert through acceleration to join them.
     f=np.asarray(fc,float); v=400.0; a8=2*np.pi*8*(v*1e-6)
     return np.where(f<8,a8/(2*np.pi*f)*1e6,v)
 
 def periodogram(x,fs):
+    """Return a one-sided, Hann-windowed PSD and its intermediate FFT stages."""
     x=np.asarray(x,float); n=len(x); x0=x-np.mean(x); w=np.hanning(n); xw=x0*w
     X=np.fft.rfft(xw); f=np.fft.rfftfreq(n,1/fs); p=np.abs(X)**2/(fs*np.sum(w*w))
+    # A real FFT contains only the non-negative half of the spectrum. Double
+    # interior bins to retain the omitted negative-frequency power, excluding
+    # DC and (for even n) the Nyquist bin.
     if n%2==0 and len(p)>2:p[1:-1]*=2
     elif n%2 and len(p)>1:p[1:]*=2
     return f,p,x0,w,xw,X
 
 def rolling_mean(x,n):
+    """Centred moving average with edge padding and unchanged output length."""
     n=max(1,int(n)); x=np.asarray(x,float)
     if n==1:return x.copy()
     l=n//2; r=n-1-l; return np.convolve(np.pad(x,(l,r),mode='edge'),np.ones(n)/n,mode='valid')
 
 @dataclass
 class Cols:
+    """Original DataFrame labels assigned to the canonical signal roles."""
+
     time:str|None=None; x:str|None=None; y:str|None=None; z:str|None=None
 
 
@@ -442,6 +472,38 @@ class BaselineSpectrum:
         return pd.DataFrame(rows,columns=['fc_hz','a_rms_g','v_rms_um_s','x_rms_um'])
 
 
+@dataclass
+class TranslationResult:
+    """One driven-axis translation result shared by Issue 1 and Issue 2."""
+    method: str
+    driven_axis: str
+    coordinates_hz: np.ndarray
+    k_values: np.ndarray
+    reference_source: str
+    reader_source: str
+    reference_domain: str
+    reference_axis: str
+    settings: dict
+    metadata: dict
+
+    def rows(self):
+        coord_name='frequency_hz' if self.method==ISSUE1_METHOD else 'fc_hz'
+        rows=[]
+        for coordinate,k in zip(self.coordinates_hz,self.k_values):
+            row={
+                'processing_method':self.method,
+                'driven_axis':self.driven_axis,
+                'reference_axis':self.reference_axis,
+                'reference_source_file':Path(self.reference_source).name if self.reference_source else '',
+                'reader_source_file':Path(self.reader_source).name if self.reader_source else '',
+                'reference_domain':self.reference_domain,
+                coord_name:float(coordinate),
+                'K_base_over_reader':float(k),
+            }
+            rows.append(row)
+        return rows
+
+
 def load_baseline_spectrum_dataframe(df,source=''):
     """Parse a frequency-domain baseline CSV and return BaselineSpectrum plus warnings."""
     freq=_column_lookup(df,['frequency_hz','freq_hz','frequency','freq','hz'])
@@ -459,12 +521,154 @@ def load_baseline_spectrum_dataframe(df,source=''):
     return spec,warnings
 
 
+def baseline_orientation(path):
+    name=Path(path).stem.lower()
+    lateral='lateral' in name
+    vertical='vertical' in name
+    return ('Lateral' if lateral else 'Vertical') if lateral != vertical else None
+
+
+def load_testhouse_table(table, source='', include_ref=False):
+    """Read paired Hz/magnitude columns without conflating commanded and measured PSD.
+
+    Ctl is always the authoritative measured baseline used for translation.  Ref may
+    optionally be retained for display/diagnostic comparison only.  Alarm and CA
+    channels are intentionally ignored.
+    """
+    names={'ctl':'Ctl'}
+    if include_ref:
+        names['ref']='Ref'
+    header=None
+    for i in range(min(30,len(table)-1)):
+        labels=[str(v).strip().lower() for v in table.iloc[i]]
+        if any(v in names for v in labels):
+            header=i; break
+    if header is None:
+        raise ValueError('Unsupported test-house layout: Missing Ctl frequency/PSD columns.')
+    traces={}
+    units=[str(v).strip().lower() for v in table.iloc[header+1]]
+    for j,value in enumerate(table.iloc[header]):
+        key=str(value).strip().lower()
+        if key not in names: continue
+        name=names.get(key,str(value).strip())
+        # Test-house names sit above magnitude; also accept names above the Hz column.
+        k=j if units[j] in ('hz','frequency_hz','frequency (hz)') else j-1
+        if k<0 or k+1>=len(units) or units[k] not in ('hz','frequency_hz','frequency (hz)') or not ('magnitude' in units[k+1] or 'psd' in units[k+1]):
+            raise ValueError(f'Unsupported {name} layout: expected paired Hz and PSD magnitude columns.')
+        rows=table.iloc[header+2:,[k,k+1]].dropna(how='all')
+        values=rows.apply(pd.to_numeric,errors='coerce').to_numpy(float)
+        if len(values)<2 or not np.isfinite(values).all():
+            raise ValueError(f'{name}: at least two numeric frequency/PSD rows are required; non-numeric or missing values found.')
+        f,q=values.T
+        if (f<0).any() or (q<0).any(): raise ValueError(f'{name}: negative frequency or PSD values are invalid.')
+        if len(np.unique(f))!=len(f): raise ValueError(f'{name}: duplicate frequencies are not supported.')
+        order=np.argsort(f); traces[name]=(f[order],q[order])
+    if 'Ctl' not in traces: raise ValueError('Missing Ctl frequency/PSD columns; Ref cannot be used for correction.')
+    f,q=traces['Ctl']
+    if f[-1]<GORDON_FC[0]/OCT_EDGE or f[0]>GORDON_FC[-1]*OCT_EDGE:
+        raise ValueError('Insufficient frequency coverage: Ctl does not overlap the Gordon bands.')
+    spec,warnings=load_baseline_spectrum_dataframe(pd.DataFrame({'frequency_hz':f,'psd_g2_per_hz':q}),source)
+    spec.traces=traces
+    spec.metadata.update({'selected_source':'Ctl','orientation':baseline_orientation(source),
+                          'baseline_type':'PSD Excel' if Path(source).suffix.lower()=='.xlsx' else 'PSD CSV',
+                          'frequency_range_hz':[float(f[0]),float(f[-1])]})
+    return spec,warnings
+
+
+def _normalise_excel_time_sheet(table,fs,label,path):
+    """Try to interpret a worksheet as a normal time-domain accelerometer table."""
+    if table.empty:
+        return None
+    frame=table.iloc[1:].copy(); frame.columns=table.iloc[0].tolist()
+    if detect_accelerometer_csv_format(frame)=='unknown':
+        return None
+    normalized,cols,rate,meta,warnings=normalize_accelerometer_dataframe(frame,fs)
+    proc=Processor(label); proc.set(normalized,cols,rate,path,metadata=meta,source_df=frame)
+    return proc,warnings
+
+
+def read_baseline_file(path,fs=200.0,include_ref=True):
+    if Path(path).suffix.lower()=='.xlsx':
+        sheets=pd.read_excel(path,header=None,sheet_name=None,engine='openpyxl')
+        candidates=[(name,t) for name,t in sheets.items() if t.astype(str).apply(lambda col: col.str.strip().str.lower().eq('ctl')).any().any()]
+        if candidates:
+            if len(candidates)!=1:
+                raise ValueError('Unsupported workbook layout: expected exactly one sheet containing Ctl frequency/PSD columns.')
+            name,table=candidates[0]
+            spec,warnings=load_testhouse_table(table,path,include_ref=include_ref); spec.metadata['worksheet']=name
+            return spec,warnings
+        time_candidates=[]
+        for name,table in sheets.items():
+            parsed=_normalise_excel_time_sheet(table,fs,'Baseline',path)
+            if parsed is not None: time_candidates.append((name,parsed))
+        if len(time_candidates)!=1:
+            raise ValueError('Unsupported baseline workbook: expected one Ctl PSD sheet or one time-domain X/Y/Z accelerometer sheet.')
+        name,(proc,warnings)=time_candidates[0]
+        proc.metadata.update({'worksheet':name,'baseline_type':'time-domain Excel'})
+        return proc,warnings
+    table=pd.read_csv(path,header=None)
+    if table.iloc[:30].astype(str).apply(lambda col: col.str.strip().str.lower().isin(['ctl','ref','alarm-','alarm+'])).any().any():
+        return load_testhouse_table(table,path,include_ref=include_ref)
+    df=pd.read_csv(path)
+    if detect_accelerometer_csv_format(df)=='baseline_psd':
+        spec,warnings=load_baseline_spectrum_dataframe(df,path)
+        spec.metadata.update({'baseline_type':'PSD CSV','selected_source':'psd_g2_per_hz',
+                              'frequency_range_hz':[float(spec.freq_hz[0]),float(spec.freq_hz[-1])]})
+        return spec,warnings
+    normalized,cols,rate,meta,warnings=normalize_accelerometer_dataframe(df,fs)
+    proc=Processor('Baseline'); meta=dict(meta); meta['baseline_type']='time-domain CSV'
+    proc.set(normalized,cols,rate,path,metadata=meta,source_df=df)
+    return proc,warnings
+
+
+def read_reader_file(path,fs=DEFAULT_FS):
+    """Load reader time samples or a test-house PSD using the existing parsers."""
+    if Path(path).suffix.lower()=='.xlsx':
+        sheets=pd.read_excel(path,header=None,sheet_name=None,engine='openpyxl')
+        spectra=[name for name,t in sheets.items()
+                 if t.iloc[:30].astype(str).apply(lambda col: col.str.strip().str.lower().isin(['ctl','ref'])).any().any()]
+        if spectra:
+            if len(spectra)!=1:
+                raise ValueError('Reader workbook contains multiple PSD sheets; use a workbook with one dataset.')
+            name=spectra[0]
+            proc,warnings=load_testhouse_table(sheets[name],path,include_ref=False)
+        else:
+            candidates=[]
+            for name,table in sheets.items():
+                if table.empty: continue
+                frame=table.iloc[1:].copy(); frame.columns=table.iloc[0].tolist()
+                if detect_accelerometer_csv_format(frame)!='unknown': candidates.append((name,frame))
+            if len(candidates)!=1:
+                raise ValueError('Unsupported reader workbook: expected one sheet with Ctl/Ref PSD pairs, frequency_hz/psd_g2_per_hz, or reader X/Y/Z acceleration columns.')
+            name,df=candidates[0]
+            if detect_accelerometer_csv_format(df)=='baseline_psd':
+                proc,warnings=load_baseline_spectrum_dataframe(df,path)
+                proc.metadata.update({'selected_source':'psd_g2_per_hz','frequency_range_hz':[float(proc.freq_hz[0]),float(proc.freq_hz[-1])]})
+            else:
+                normalized,cols,rate,meta,warnings=normalize_accelerometer_dataframe(df,fs)
+                proc=Processor('Reader'); proc.set(normalized,cols,rate,path,metadata=meta,source_df=df)
+        proc.metadata['worksheet']=name
+    else:
+        proc,warnings=read_baseline_file(path,fs,include_ref=False)
+    proc.label='Reader'
+    proc.metadata.pop('baseline_type',None)
+    proc.metadata['reader_type']=('PSD' if isinstance(proc,BaselineSpectrum) else 'time-domain') + (' Excel' if Path(path).suffix.lower()=='.xlsx' else ' CSV')
+    return proc,warnings
+
+
 class Processor:
+    """A single three-axis time history and its signal-processing operations.
+
+    ``original_df`` is immutable working provenance. Cropping changes ``df``
+    only, allowing every new crop or export to begin from the imported samples.
+    """
+
     def __init__(self,label):
         self.label=label; self.df=None; self.original_df=None; self.source_df=None; self.cols=Cols(); self.fs=DEFAULT_FS; self.source=''; self.metadata={}
     @property
     def loaded(self): return self.df is not None and all([self.cols.x,self.cols.y,self.cols.z])
     def set(self,df,cols,fs,source='',metadata=None,source_df=None):
+        """Load canonical data while retaining both original and source tables."""
         self.original_df=df.copy().reset_index(drop=True)
         self.df=self.original_df.copy()
         self.source_df=(source_df.copy().reset_index(drop=True) if source_df is not None else self.original_df.copy())
@@ -481,13 +685,16 @@ class Processor:
         c={'X':self.cols.x,'Y':self.cols.y,'Z':self.cols.z}[a]
         return pd.to_numeric(self.df[c],errors='coerce').to_numpy(float)
     def xyz(self):
+        """Return aligned finite time/X/Y/Z arrays, dropping any bad row."""
         t=self.time(); x,y,z=[self.axis(a) for a in 'XYZ']; m=np.isfinite(t)&np.isfinite(x)&np.isfinite(y)&np.isfinite(z)
         return t[m],x[m],y[m],z[m]
     def timebase(self):
+        """Summarise measured timing, jitter, and gaps for diagnostics."""
         t,*_=self.xyz(); dt=np.diff(t); g=dt[np.isfinite(dt)&(dt>0)]
         if len(g)==0:return {}
         med=float(np.median(g)); return {'samples':len(t),'duration_s':float(t[-1]-t[0]),'median_fs_hz':1/med,'jitter_std_s':float(np.std(g-med)),'gaps':int(np.sum(g>1.5*med))}
     def welch(self,a,start,n,overlap,segs):
+        """Calculate and average ``segs`` overlapping periodograms for one axis."""
         arr=self.axis(a); hop=int(round(n*(1-overlap))); need=n+(segs-1)*hop
         if start<0 or start+need>len(arr): raise ValueError(f'{self.label}: need {need} samples from start {start}')
         ps=[]; xs=[]; starts=[]
@@ -495,11 +702,13 @@ class Processor:
             s=start+i*hop; f,p,*rest=periodogram(arr[s:s+n],self.fs); ps.append(p); xs.append(rest[-1]); starts.append(s)
         return f,np.vstack(ps),np.mean(ps,axis=0),starts
     def stage(self,a,start,n):
+        """Expose each processing stage for the GUI's teaching/diagnostic plot."""
         arr=self.axis(a)
         if start<0 or start+n>len(arr):raise ValueError(f'{self.label}: selected block outside data')
         f,p,x0,w,xw,X=periodogram(arr[start:start+n],self.fs)
         return {'raw':arr[start:start+n],'mean_removed':x0,'window':w,'windowed':xw,'freq':f,'fft':X,'fft_mag':np.abs(X),'psd':p}
     def bands(self,f,p):
+        """Integrate a PSD into Gordon one-third-octave RMS engineering units."""
         df=f[1]-f[0]; rows=[]
         for fc in GORDON_FC:
             lo,hi=fc/OCT_EDGE,fc*OCT_EDGE; m=(f>=lo)&(f<hi); ms=float(np.sum(p[m])*df) if np.any(m) else 0
@@ -512,11 +721,14 @@ class Processor:
         return t,xa,ya,za,roll,pitch,n
 
 class PairAnalysis:
+    """Paired baseline/reader transfer and correction calculations."""
+
     def __init__(self,base,reader): self.base=base; self.reader=reader
     def check(self):
         if not(self.base.loaded and self.reader.loaded): raise ValueError('Load both baseline and reader datasets.')
         if abs(self.base.fs-self.reader.fs)>1e-6: raise ValueError('Baseline and reader sample rates must match.')
     def paired_band_window(self,start,n,overlap,segs):
+        """Compare both sensors over one identical multi-segment time span."""
         self.check(); out=[]
         for a in 'XYZ':
             fb,_,pb,_=self.base.welch(a,start,n,overlap,segs); fr,_,pr,_=self.reader.welch(a,start,n,overlap,segs)
@@ -527,6 +739,7 @@ class PairAnalysis:
             out.append(d)
         return pd.concat(out,ignore_index=True)
     def series(self,n,overlap,segs):
+        """Evaluate consecutive non-overlapping analysis spans for model fitting."""
         self.check(); hop=int(round(n*(1-overlap))); span=n+(segs-1)*hop; total=min(len(self.base.df),len(self.reader.df)); starts=list(range(0,total-span+1,span))
         frames=[]
         for wi,s in enumerate(starts):
@@ -583,17 +796,22 @@ class PairAnalysis:
         return scores,rec,common,band,d
 
     def h1(self,a,n,overlap):
+        """Estimate reader/base H1 transfer function and magnitude-squared coherence."""
         self.check(); xb=self.base.axis(a); yr=self.reader.axis(a); total=min(len(xb),len(yr)); hop=int(round(n*(1-overlap)))
         Gxx=None; Gyx=None; Gyy=None; count=0; w=np.hanning(n); U=np.sum(w*w)
         for s in range(0,total-n+1,hop):
             x=(xb[s:s+n]-np.mean(xb[s:s+n]))*w; y=(yr[s:s+n]-np.mean(yr[s:s+n]))*w
             X=np.fft.rfft(x); Y=np.fft.rfft(y); xx=X*np.conj(X); yx=Y*np.conj(X); yy=Y*np.conj(Y)
             Gxx=xx if Gxx is None else Gxx+xx; Gyx=yx if Gyx is None else Gyx+yx; Gyy=yy if Gyy is None else Gyy+yy; count+=1
+        # H1 = cross(reader, base) / auto(base). Coherence indicates which
+        # frequencies have enough linear relationship for H1 to be meaningful.
         Gxx/=max(count,1); Gyx/=max(count,1); Gyy/=max(count,1); H=np.divide(Gyx,Gxx,out=np.zeros_like(Gyx),where=np.abs(Gxx)>1e-20)
         coh=np.divide(np.abs(Gyx)**2,Gxx.real*Gyy.real,out=np.zeros(len(Gxx)),where=(Gxx.real*Gyy.real)>1e-20)
         f=np.fft.rfftfreq(n,1/self.base.fs); return f,H,np.clip(coh,0,1)
 
 class App:
+    """Tkinter controller for offline analysis and live VMM acquisition."""
+
     def __init__(self,root):
         self.root=root; root.title(APP_TITLE); root.geometry('1500x930'); root.minsize(1150,720)
         self.base=Processor('Baseline'); self.reader=Processor('Reader'); self.pair=PairAnalysis(self.base,self.reader)
@@ -602,13 +820,26 @@ class App:
         # remains one three-axis CSV. A missing baseline may explicitly reuse a
         # different loaded baseline axis via baseline_use_axis.
         self.baselines={axis:None for axis in 'XYZ'}
+        # Characterisation reader captures are retained by deliberately driven
+        # axis. self.reader remains the currently selected run for backward
+        # compatibility with the existing plotting code.
+        self.reader_runs={axis:None for axis in 'XYZ'}
         self.baseline_use_axis={axis:tk.StringVar(value=axis) for axis in 'XYZ'}
-        self.fs=tk.DoubleVar(value=DEFAULT_FS); self.n=tk.IntVar(value=DEFAULT_N); self.ov=tk.DoubleVar(value=50); self.segs=tk.IntVar(value=4); self.start=tk.IntVar(value=0); self.stage_block=tk.IntVar(value=1); self.stage_axis=tk.StringVar(value='X'); self.transfer_axis=tk.StringVar(value='X'); self.axis=tk.StringVar(value='X'); self.driven_axis=tk.StringVar(value='X'); self.avg=tk.DoubleVar(value=.25); self.units=tk.StringVar(value='RMS velocity (µm/s)'); self.auto_crop=tk.BooleanVar(value=True); self.offline_shock_window=tk.IntVar(value=50); self.offline_shock_threshold_g=tk.DoubleVar(value=1.0); self.offline_shock_release_s=tk.DoubleVar(value=0.25); self.offline_shock_axis=tk.StringVar(value='X')
+        self.lateral_assignment=tk.StringVar(value='X and Y')
+        self.fs=tk.DoubleVar(value=DEFAULT_FS); self.n=tk.IntVar(value=DEFAULT_N); self.ov=tk.DoubleVar(value=50); self.segs=tk.IntVar(value=4); self.start=tk.IntVar(value=0); self.stage_block=tk.IntVar(value=1); self.stage_axis=tk.StringVar(value='X'); self.transfer_axis=tk.StringVar(value='X'); self.axis=tk.StringVar(value='X'); self.driven_axis=tk.StringVar(value='X'); self.units=tk.StringVar(value='RMS velocity (µm/s)'); self.auto_crop=tk.BooleanVar(value=True); self.offline_shock_window=tk.IntVar(value=50); self.offline_shock_threshold_g=tk.DoubleVar(value=1.0); self.offline_shock_release_s=tk.DoubleVar(value=0.25); self.offline_shock_axis=tk.StringVar(value='X')
         # Dedicated shock-characterisation files. Each X/Y/Z file still contains
         # all three measured accelerometer channels; the filename identifies the
         # intentionally applied shock direction.
         self.shock_baselines={axis:None for axis in 'XYZ'}
         self.shock_readers={axis:None for axis in 'XYZ'}
+        # Custom scrollable tab navigation keeps engineering tab labels readable.
+        self._tab_nav_buttons=[]
+        self._tab_nav_canvas=None
+        self._tab_nav_inner=None
+        # Final production-correction assembly. Each axis is deliberately stored
+        # from its own driven-axis run rather than inferred from orthogonal channels.
+        self.stored_correction_axes={axis:None for axis in 'XYZ'}
+        self.stored_correction_status=tk.StringVar(value='Final XYZ correction: X — | Y — | Z —')
         self.status=tk.StringVar(value='Load a baseline and reader dataset, or use the paired demo.')
 
         # Live LIS2DUX12 acquisition from the specialty hw_test_vmm firmware.
@@ -633,6 +864,15 @@ class App:
         self.accel_fft_window=tk.StringVar(value='Hann')
         self.accel_fft_overlap=tk.DoubleVar(value=50.0)
         self.accel_psd_averages=tk.IntVar(value=4)
+        self.processing_method=tk.StringVar(value=ISSUE2_METHOD)
+        self.applied_processing_method=ISSUE2_METHOD
+        self.processing_method_details=tk.StringVar(
+            value='Issue 2: Welch PSD averaging and Gordon one-third-octave integration.')
+        self.issue1_waterfall_axis=tk.StringVar(value='X')
+        # Read-only summary of the applied host settings. The editable source
+        # remains the accel_* controls; fs/n/ov/segs are the shared applied
+        # values consumed by both offline and live processing.
+        self.processing_status=tk.StringVar()
         self.accel_config_status=tk.StringVar(value='Requested configuration not yet written to STM32')
         self.accel_readback_status=tk.StringVar(value='Live read-back: waiting for sample block')
         self.accel_program_result=tk.StringVar(value='NOT PROGRAMMED')
@@ -685,7 +925,7 @@ class App:
         self.live_tilt_zero_roll=None
         self.live_tilt_zero_pitch=None
         self.live_tilt_readout=tk.StringVar(value='Waiting for live samples')
-        self.live_tilt_avg_seconds=tk.DoubleVar(value=2.0)
+        self.tilt_average_samples=tk.IntVar(value=50)
         self.live_tilt_max_dynamic_g=tk.DoubleVar(value=0.05)
         self.live_tilt_min_gravity_g=tk.DoubleVar(value=0.80)
         self.live_tilt_max_gravity_g=tk.DoubleVar(value=1.20)
@@ -714,6 +954,8 @@ class App:
         self.live_k_correction_enabled=tk.BooleanVar(value=False)
         self.live_k_status=tk.StringVar(value='K correction: not loaded')
         self.live_k_factors={axis:None for axis in 'XYZ'}
+        self.live_k_coordinates=None
+        self.live_k_method=None
         self.live_k_source_files=[]
 
         self.live_t=[]; self.live_x=[]; self.live_y=[]; self.live_z=[]
@@ -722,7 +964,14 @@ class App:
         self.live_stream_health=tk.StringVar(value='Stream health: waiting for data')
         self.live_packets=0; self.live_dropped_or_invalid=0
 
-        self._build(); self.root.after(100,self._poll_live_queue)
+        self._update_processing_status()
+
+        # Tk must be touched only by its main thread. This recurring callback is
+        # the bridge from serial worker events to UI state and plots.
+        self._build()
+        self._sync_processing_method_controls()
+        self._sync_applied_mode_tabs()
+        self.root.after(100,self._poll_live_queue)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
     def _build(self):
         header=ttk.Frame(self.root,padding=(6,6,6,0))
@@ -731,21 +980,27 @@ class App:
         actions=ttk.Frame(header)
         actions.pack(fill=tk.X)
         for txt,cmd in [
-            ('Load baseline CSV(s)',self.load_baseline_csvs),
-            ('Load reader CSV',lambda:self.load_csv('reader')),
+            ('Load baseline/reference file(s)',self.load_baseline_csvs),
+            ('Load reader CSV/XLSX',lambda:self.load_csv('reader')),
             ('Load paired demo',self.load_demo_pair),
             ('Export derived correction',self.export_correction),
+            ('Store driven-axis K',self.store_current_axis_correction),
+            ('Export final XYZ K',self.export_stored_xyz_correction),
             ('Save plot',self.save_plot),
         ]:
-            ttk.Button(actions,text=txt,command=cmd).pack(side=tk.LEFT,padx=3,pady=(0,2))
+            button=ttk.Button(actions,text=txt,command=cmd)
+            button.pack(side=tk.LEFT,padx=3,pady=(0,2))
+            if txt=='Export derived correction':
+                self.btn_export_correction=button
 
         settings=ttk.Frame(header)
         settings.pack(fill=tk.X,pady=(2,6))
-        ttk.Label(settings,text='Processing settings').pack(side=tk.LEFT,padx=(2,10))
-        for lab,var,wid in [('fs Hz',self.fs,7),('FFT N',self.n,6),('Overlap %',self.ov,6),('PSD avg',self.segs,5)]:
-            ttk.Label(settings,text=lab).pack(side=tk.LEFT)
-            ttk.Entry(settings,textvariable=var,width=wid).pack(side=tk.LEFT,padx=(2,8))
-        ttk.Button(settings,text='Reprocess',command=self.refresh).pack(side=tk.LEFT,padx=5)
+        ttk.Label(
+            settings,
+            textvariable=self.processing_status,
+            font=('Segoe UI',9,'bold'),
+        ).pack(side=tk.LEFT,padx=(2,10))
+        ttk.Label(settings,textvariable=self.stored_correction_status).pack(side=tk.LEFT,padx=(8,4))
 
         pan=ttk.Panedwindow(self.root,orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH,expand=True)
@@ -779,11 +1034,12 @@ class App:
         self.base_label.pack(anchor=tk.W,pady=2)
         self.reader_label=ttk.Label(datasets_section.body,text='Reader: not loaded',wraplength=280,justify=tk.LEFT)
         self.reader_label.pack(anchor=tk.W,pady=2)
-        ttk.Checkbutton(
+        self.auto_crop_check=ttk.Checkbutton(
             datasets_section.body,
             text='Auto-crop paired datasets to common usable duration',
             variable=self.auto_crop,command=self.refresh,
-        ).pack(anchor=tk.W,pady=(5,1))
+        )
+        self.auto_crop_check.pack(anchor=tk.W,pady=(5,1))
         ttk.Label(
             datasets_section.body,
             text='When enabled, the original files are preserved. Analysis is cropped to the common overlapping time/sample range and then to a whole number of complete PSD-analysis spans.',
@@ -792,6 +1048,11 @@ class App:
 
         mapping_section=CollapsibleSection(sidebar,'Correction baseline mapping',expanded=True)
         mapping_section.pack(fill=tk.X,pady=(0,6))
+        ttk.Label(mapping_section.body,text='Lateral reference assignment').pack(anchor=tk.W,pady=(0,1))
+        ttk.Combobox(
+            mapping_section.body,textvariable=self.lateral_assignment,
+            values=['X and Y','X only','Y only'],state='readonly'
+        ).pack(fill=tk.X,pady=(0,4))
         for target_axis in 'XYZ':
             mr=ttk.Frame(mapping_section.body)
             mr.pack(fill=tk.X,pady=1)
@@ -801,7 +1062,7 @@ class App:
             mcb.bind('<<ComboboxSelected>>',lambda e,a=target_axis:self._on_baseline_mapping_changed(a))
         ttk.Label(
             mapping_section.body,
-            text='Normally X→X, Y→Y and Z→Z. If one baseline file is missing, choose another loaded baseline axis as an explicit surrogate.',
+            text='Lateral Ctl → X and Y; Vertical Ctl → Z. Legacy files use X→X, Y→Y, Z→Z. Select another source only as an explicit surrogate.',
             wraplength=280,justify=tk.LEFT,
         ).pack(anchor=tk.W,pady=(3,2))
 
@@ -809,18 +1070,40 @@ class App:
         analysis_section.pack(fill=tk.X,pady=(0,6))
         r=ttk.Frame(analysis_section.body)
         r.pack(fill=tk.X,pady=2)
-        ttk.Label(r,text='PSD-set start sample').pack(side=tk.LEFT)
+        ttk.Label(r,text='Analysis start sample').pack(side=tk.LEFT)
         ttk.Entry(r,textvariable=self.start,width=9).pack(side=tk.RIGHT)
         ttk.Label(analysis_section.body,text='Gordon units').pack(anchor=tk.W,pady=(7,1))
-        u=ttk.Combobox(
+        self.units_combo=ttk.Combobox(
             analysis_section.body,textvariable=self.units,
             values=['RMS velocity (µm/s)','RMS acceleration (g)','RMS displacement (µm)'],
             state='readonly')
-        u.pack(fill=tk.X)
-        u.bind('<<ComboboxSelected>>',lambda e:self.plot_bands())
+        self.units_combo.pack(fill=tk.X)
+        self.units_combo.bind('<<ComboboxSelected>>',self._display_units_changed)
 
-        self.tabs=ttk.Notebook(right)
+        # Horizontally scrollable tab strip. The native ttk.Notebook headers
+        # become compressed once many engineering views are present, so keep
+        # full-size labels in a scrollable strip while Notebook manages pages.
+        tab_nav=ttk.Frame(right)
+        tab_nav.pack(fill=tk.X,pady=(0,2))
+        ttk.Button(tab_nav,text='◀',width=3,command=lambda:self._scroll_tab_strip(-1)).pack(side=tk.LEFT,padx=(0,2))
+        nav_holder=ttk.Frame(tab_nav)
+        nav_holder.pack(side=tk.LEFT,fill=tk.X,expand=True)
+        ttk.Button(tab_nav,text='▶',width=3,command=lambda:self._scroll_tab_strip(1)).pack(side=tk.RIGHT,padx=(2,0))
+        self._tab_nav_canvas=tk.Canvas(nav_holder,height=30,highlightthickness=0,borderwidth=0)
+        self._tab_nav_canvas.pack(fill=tk.X,expand=True)
+        self._tab_nav_inner=ttk.Frame(self._tab_nav_canvas)
+        self._tab_nav_window=self._tab_nav_canvas.create_window((0,0),window=self._tab_nav_inner,anchor='nw')
+        self._tab_nav_inner.bind('<Configure>',lambda e:self._tab_nav_canvas.configure(scrollregion=self._tab_nav_canvas.bbox('all')))
+        self._tab_nav_canvas.bind('<MouseWheel>',self._on_tab_nav_mousewheel)
+        self._tab_nav_canvas.bind('<Shift-MouseWheel>',self._on_tab_nav_mousewheel)
+        style=ttk.Style()
+        try:
+            style.layout('HiddenTabs.TNotebook.Tab', [])
+        except tk.TclError:
+            pass
+        self.tabs=ttk.Notebook(right,style='HiddenTabs.TNotebook')
         self.tabs.pack(fill=tk.BOTH,expand=True)
+        self.tabs.bind('<<NotebookTabChanged>>',lambda e:self._sync_tab_nav_selection())
         self.fig={}
 
         # General comparison views show all three axes. Axis-specific selectors live only
@@ -835,6 +1118,35 @@ class App:
             tb.update()
             tb.pack(fill=tk.X)
             self.fig[name]=(f,c)
+
+        tab=ttk.Frame(self.tabs)
+        self.tabs.add(tab,text='Issue 1 FFT ensemble')
+        issue1_controls=ttk.Frame(tab,padding=(5,3))
+        issue1_controls.pack(fill=tk.X)
+        ttk.Label(issue1_controls,text='Individual FFT axis').pack(side=tk.LEFT,padx=(2,2))
+        issue1_axis=ttk.Combobox(
+            issue1_controls,textvariable=self.issue1_waterfall_axis,
+            values=list('XYZ'),state='readonly',width=5)
+        issue1_axis.pack(side=tk.LEFT,padx=(0,10))
+        issue1_axis.bind('<<ComboboxSelected>>',lambda e:self.plot_issue1_analysis())
+        ttk.Button(
+            issue1_controls,text='Reprocess Issue 1',
+            command=self.plot_issue1_analysis,
+        ).pack(side=tk.LEFT,padx=5)
+        ttk.Label(
+            issue1_controls,
+            text='Legacy amplitude ensemble; separate from Welch PSD/Gordon integration.',
+        ).pack(side=tk.LEFT,padx=6)
+        f=Figure(figsize=(9,6),dpi=100)
+        c=FigureCanvasTkAgg(f,master=tab)
+        c.get_tk_widget().pack(fill=tk.BOTH,expand=True)
+        tb=NavigationToolbar2Tk(c,tab,pack_toolbar=False)
+        tb.update(); tb.pack(fill=tk.X)
+        self.fig['Issue 1 FFT ensemble']=(f,c)
+        ax=f.add_subplot(111); ax.axis('off')
+        ax.text(.5,.5,'Select and apply Issue 1, then load a Reader CSV.',
+                ha='center',va='center',fontsize=12)
+        c.draw_idle()
 
         # Offline shock analysis follows Raw comparison so recorded reader files
         # can be inspected directly using the Issue-2 time-domain method.
@@ -879,9 +1191,35 @@ class App:
         tb.pack(fill=tk.X)
         self.fig['Shock translation']=(f,c)
 
+        tab=ttk.Frame(self.tabs)
+        self.tabs.add(tab,text='Shock summary')
+        shock_summary_controls=ttk.Frame(tab,padding=(5,3))
+        shock_summary_controls.pack(fill=tk.X)
+        ttk.Button(shock_summary_controls,text='Load shock baseline CSV(s)',command=lambda:self.load_shock_csvs('baseline')).pack(side=tk.LEFT,padx=(2,4))
+        ttk.Button(shock_summary_controls,text='Load shock reader CSV(s)',command=lambda:self.load_shock_csvs('reader')).pack(side=tk.LEFT,padx=4)
+        ttk.Button(shock_summary_controls,text='Refresh summary',command=self.refresh_shock_summary).pack(side=tk.LEFT,padx=(12,4))
+        ttk.Button(shock_summary_controls,text='Export shock results',command=self.export_shock_results).pack(side=tk.LEFT,padx=4)
+        ttk.Label(shock_summary_controls,text='One row per deliberately applied X/Y/Z shock direction.').pack(side=tk.LEFT,padx=8)
+        shock_summary_frame=ttk.Frame(tab,padding=6)
+        shock_summary_frame.pack(fill=tk.BOTH,expand=True)
+        cols=('applied','baseline','reader','bpeak','rpeak','kshock','events','dominant')
+        self.shock_summary_tree=ttk.Treeview(shock_summary_frame,columns=cols,show='headings',height=6)
+        headings={'applied':'Applied','baseline':'Baseline file','reader':'Reader file','bpeak':'Baseline peak S (g)','rpeak':'Reader peak S (g)','kshock':'Kshock B/R','events':'Reader events','dominant':'Dominant axis'}
+        widths={'applied':75,'baseline':220,'reader':220,'bpeak':125,'rpeak':125,'kshock':95,'events':95,'dominant':95}
+        for col in cols:
+            self.shock_summary_tree.heading(col,text=headings[col])
+            self.shock_summary_tree.column(col,width=widths[col],minwidth=70,anchor=tk.CENTER if col not in ('baseline','reader') else tk.W)
+        ybar=ttk.Scrollbar(shock_summary_frame,orient=tk.VERTICAL,command=self.shock_summary_tree.yview)
+        xbar=ttk.Scrollbar(shock_summary_frame,orient=tk.HORIZONTAL,command=self.shock_summary_tree.xview)
+        self.shock_summary_tree.configure(yscrollcommand=ybar.set,xscrollcommand=xbar.set)
+        self.shock_summary_tree.grid(row=0,column=0,sticky='nsew')
+        ybar.grid(row=0,column=1,sticky='ns'); xbar.grid(row=1,column=0,sticky='ew')
+        shock_summary_frame.rowconfigure(0,weight=1); shock_summary_frame.columnconfigure(0,weight=1)
+
         for name in ['PSD comparison','Gordon bands','Translation function']:
             tab=ttk.Frame(self.tabs)
-            self.tabs.add(tab,text=name)
+            display_name='Gordon comparison' if name=='Gordon bands' else name
+            self.tabs.add(tab,text=display_name)
             f=Figure(figsize=(9,6),dpi=100)
             c=FigureCanvasTkAgg(f,master=tab)
             c.get_tk_widget().pack(fill=tk.BOTH,expand=True)
@@ -891,18 +1229,24 @@ class App:
             self.fig[name]=(f,c)
 
         tab=ttk.Frame(self.tabs)
-        self.tabs.add(tab,text='Selected stage')
+        self.tabs.add(tab,text='Calculation stages')
         stage_controls=ttk.Frame(tab,padding=(5,3))
         stage_controls.pack(fill=tk.X)
         ttk.Label(stage_controls,text='Axis').pack(side=tk.LEFT,padx=(2,2))
         scb=ttk.Combobox(stage_controls,textvariable=self.stage_axis,values=list('XYZ'),state='readonly',width=5)
         scb.pack(side=tk.LEFT,padx=(0,10))
         scb.bind('<<ComboboxSelected>>',lambda e:self.plot_stage())
-        ttk.Label(stage_controls,text='FFT block').pack(side=tk.LEFT,padx=(2,2))
-        sb=ttk.Combobox(stage_controls,textvariable=self.stage_block,values=[1,2,3,4],state='readonly',width=5)
-        sb.pack(side=tk.LEFT,padx=(0,10))
-        sb.bind('<<ComboboxSelected>>',lambda e:self.plot_stage())
-        ttk.Label(stage_controls,text='Blocks are the overlapping segments used in the PSD average.').pack(side=tk.LEFT,padx=4)
+        self.stage_block_label=ttk.Label(stage_controls,text='FFT block')
+        self.stage_block_label.pack(side=tk.LEFT,padx=(2,2))
+        self.stage_block_combo=ttk.Combobox(
+            stage_controls,textvariable=self.stage_block,
+            values=[1,2,3,4],state='readonly',width=5)
+        self.stage_block_combo.pack(side=tk.LEFT,padx=(0,10))
+        self.stage_block_combo.bind('<<ComboboxSelected>>',lambda e:self.plot_stage())
+        self.stage_explanation=ttk.Label(
+            stage_controls,
+            text='Blocks are the overlapping segments used in the PSD average.')
+        self.stage_explanation.pack(side=tk.LEFT,padx=4)
         f=Figure(figsize=(9,6),dpi=100)
         c=FigureCanvasTkAgg(f,master=tab)
         c.get_tk_widget().pack(fill=tk.BOTH,expand=True)
@@ -930,6 +1274,8 @@ class App:
         self._build_live_tab()
         self._build_live_analysis_tabs()
         self._build_help_tab()
+        self._build_tab_navigation_buttons()
+        self.refresh_shock_summary()
         ttk.Label(self.root,textvariable=self.status,relief=tk.SUNKEN,anchor=tk.W).pack(fill=tk.X,side=tk.BOTTOM)
     def _toggle_main_sidebar(self):
         """Collapse/restore the complete offline control sidebar horizontally."""
@@ -954,6 +1300,68 @@ class App:
                 pass
             self.main_sidebar_collapsed=False
             self.main_sidebar_toggle.configure(text='◀')
+
+    def _build_tab_navigation_buttons(self):
+        if self._tab_nav_inner is None:
+            return
+        for child in self._tab_nav_inner.winfo_children():
+            child.destroy()
+        self._tab_nav_buttons=[]
+        for i in range(self.tabs.index('end')):
+            name=self.tabs.tab(i,'text')
+            btn=ttk.Button(self._tab_nav_inner,text=name,command=lambda n=i:self._select_tab_from_nav(n))
+            btn.pack(side=tk.LEFT,padx=1,pady=1)
+            self._tab_nav_buttons.append(btn)
+        self._sync_tab_nav_selection()
+        self.root.after_idle(self._ensure_selected_tab_visible)
+
+    def _select_tab_from_nav(self,index):
+        self.tabs.select(index)
+        self._sync_tab_nav_selection()
+        self.root.after_idle(self._ensure_selected_tab_visible)
+
+    def _sync_tab_nav_selection(self):
+        if not self._tab_nav_buttons:
+            return
+        try:
+            selected=self.tabs.index(self.tabs.select())
+        except Exception:
+            selected=0
+        for i,btn in enumerate(self._tab_nav_buttons):
+            try:
+                btn.state(['pressed'] if i==selected else ['!pressed'])
+            except tk.TclError:
+                pass
+        self.root.after_idle(self._ensure_selected_tab_visible)
+
+    def _ensure_selected_tab_visible(self):
+        if self._tab_nav_canvas is None or not self._tab_nav_buttons:
+            return
+        try:
+            selected=self.tabs.index(self.tabs.select())
+            btn=self._tab_nav_buttons[selected]
+            self._tab_nav_canvas.update_idletasks()
+            total=max(1,self._tab_nav_inner.winfo_reqwidth())
+            view=max(1,self._tab_nav_canvas.winfo_width())
+            bx=btn.winfo_x(); bw=btn.winfo_width()
+            left=self._tab_nav_canvas.canvasx(0); right=left+view
+            if bx<left:
+                self._tab_nav_canvas.xview_moveto(max(0.0,bx/total))
+            elif bx+bw>right:
+                self._tab_nav_canvas.xview_moveto(min(1.0,max(0.0,(bx+bw-view)/total)))
+        except Exception:
+            pass
+
+    def _scroll_tab_strip(self,direction):
+        if self._tab_nav_canvas is not None:
+            self._tab_nav_canvas.xview_scroll(int(direction)*4,'units')
+
+    def _on_tab_nav_mousewheel(self,event):
+        if self._tab_nav_canvas is None:
+            return 'break'
+        delta=-1 if getattr(event,'delta',0)>0 else 1
+        self._tab_nav_canvas.xview_scroll(delta*4,'units')
+        return 'break'
 
     def _build_live_tab(self):
         tab=ttk.Frame(self.tabs)
@@ -1054,7 +1462,9 @@ class App:
         self.live_threshold_value_label.pack(side=tk.LEFT,padx=(4,2))
         self.live_threshold_value_entry=ttk.Entry(row6,textvariable=self.live_threshold_value,width=9)
         self.live_threshold_value_entry.pack(side=tk.LEFT,padx=(0,8))
-        ttk.Button(row6,text='Apply',command=self.live_apply_threshold).pack(side=tk.LEFT,padx=6)
+        self.live_threshold_apply_button=ttk.Button(
+            row6,text='Apply',command=self.live_apply_threshold)
+        self.live_threshold_apply_button.pack(side=tk.LEFT,padx=6)
         self._update_live_threshold_control_states()
 
         ttk.Label(threshold_body,textvariable=self.live_threshold_status,wraplength=340,justify=tk.LEFT).pack(anchor=tk.W,padx=4,pady=(0,4))
@@ -1062,10 +1472,10 @@ class App:
         row7=ttk.Frame(threshold_body); row7.pack(fill=tk.X,pady=2)
         ttk.Label(row7,text='Display retention').pack(side=tk.LEFT,padx=(4,2))
         ttk.Entry(row7,textvariable=self.live_retention_seconds,width=8).pack(side=tk.LEFT,padx=2)
-        ttk.Label(row7,text='seconds').pack(side=tk.LEFT,padx=(1,12))
-        self.btn_raw_log_start=ttk.Button(row7,text='Start raw-count log',command=self.live_start_raw_log)
+        ttk.Label(row7,text='sec').pack(side=tk.LEFT,padx=(1,12))
+        self.btn_raw_log_start=ttk.Button(row7,text='Start raw log',command=self.live_start_raw_log)
         self.btn_raw_log_start.pack(side=tk.LEFT,padx=3)
-        self.btn_raw_log_stop=ttk.Button(row7,text='Stop raw-count log',command=self.live_stop_raw_log,state=tk.DISABLED)
+        self.btn_raw_log_stop=ttk.Button(row7,text='Stop raw log',command=self.live_stop_raw_log,state=tk.DISABLED)
         self.btn_raw_log_stop.pack(side=tk.LEFT,padx=3)
 
         ttk.Label(threshold_body,textvariable=self.raw_log_status,wraplength=340,justify=tk.LEFT).pack(anchor=tk.W,padx=4,pady=(0,4))
@@ -1089,19 +1499,25 @@ class App:
         motion=correction_section.body
 
         k_row=ttk.Frame(motion); k_row.pack(fill=tk.X,pady=(1,3))
-        ttk.Checkbutton(k_row,text='Apply live multi-frequency K correction',
-                        variable=self.live_k_correction_enabled,
-                        command=self._on_live_k_toggle).pack(side=tk.LEFT,padx=(4,8))
+        self.live_k_enable_check=ttk.Checkbutton(
+            k_row,text='Apply live multi-frequency K correction',
+            variable=self.live_k_correction_enabled,
+            command=self._on_live_k_toggle)
+        self.live_k_enable_check.pack(side=tk.LEFT,padx=(4,8))
         k_btns=ttk.Frame(motion)
         k_btns.pack(fill=tk.X,pady=(0,2))
-        ttk.Button(k_btns,text='Load K-factor CSV(s)',command=self.load_live_k_correction).pack(side=tk.LEFT,padx=3)
-        ttk.Button(k_btns,text='Clear K factors',command=self.clear_live_k_correction).pack(side=tk.LEFT,padx=3)
+        self.live_k_load_button=ttk.Button(
+            k_btns,text='Load K-factor CSV(s)',command=self.load_live_k_correction)
+        self.live_k_load_button.pack(side=tk.LEFT,padx=3)
+        self.live_k_clear_button=ttk.Button(
+            k_btns,text='Clear K factors',command=self.clear_live_k_correction)
+        self.live_k_clear_button.pack(side=tk.LEFT,padx=3)
         ttk.Label(motion,textvariable=self.live_k_status,wraplength=340,justify=tk.LEFT).pack(anchor=tk.W,padx=4,pady=(0,4))
 
         tilt_row=ttk.Frame(motion); tilt_row.pack(fill=tk.X,pady=(1,3))
         ttk.Button(tilt_row,text='Zero tilt at current position',command=self.live_zero_tilt).pack(side=tk.LEFT,padx=3)
-        ttk.Label(tilt_row,text='Averaging (s)').pack(side=tk.LEFT,padx=(10,2))
-        ttk.Entry(tilt_row,textvariable=self.live_tilt_avg_seconds,width=6).pack(side=tk.LEFT,padx=(0,8))
+        ttk.Label(tilt_row,text='Averaging (samples)').pack(side=tk.LEFT,padx=(10,2))
+        ttk.Entry(tilt_row,textvariable=self.tilt_average_samples,width=6).pack(side=tk.LEFT,padx=(0,8))
         ttk.Label(tilt_row,text='Max dynamic RMS (g)').pack(side=tk.LEFT,padx=(4,2))
         ttk.Entry(tilt_row,textvariable=self.live_tilt_max_dynamic_g,width=6).pack(side=tk.LEFT,padx=(0,4))
         ttk.Label(motion,textvariable=self.live_tilt_readout,wraplength=340,justify=tk.LEFT).pack(anchor=tk.W,padx=4,pady=(0,4))
@@ -1122,6 +1538,23 @@ class App:
         accel_section.pack(fill=tk.X,pady=(0,4))
         accel_cfg=accel_section.body
 
+        ac0=ttk.Frame(accel_cfg); ac0.pack(fill=tk.X,pady=2)
+        ttk.Label(ac0,text='Processing method').pack(side=tk.LEFT,padx=(4,2))
+        self.issue1_mode_button=ttk.Radiobutton(
+            ac0,text='Issue 1 — Legacy FFT',variable=self.processing_method,
+            value=ISSUE1_METHOD,command=self._processing_method_changed,
+            style='Toolbutton')
+        self.issue1_mode_button.pack(side=tk.LEFT,padx=(2,1))
+        self.issue2_mode_button=ttk.Radiobutton(
+            ac0,text='Issue 2 — PSD/Gordon',variable=self.processing_method,
+            value=ISSUE2_METHOD,command=self._processing_method_changed,
+            style='Toolbutton')
+        self.issue2_mode_button.pack(side=tk.LEFT,padx=(1,8))
+        ttk.Label(
+            accel_cfg,textvariable=self.processing_method_details,
+            wraplength=340,justify=tk.LEFT,
+        ).pack(fill=tk.X,padx=4,pady=(0,3))
+
         ac1=ttk.Frame(accel_cfg); ac1.pack(fill=tk.X,pady=2)
         ttk.Label(ac1,text='Device').pack(side=tk.LEFT,padx=(4,2))
         ttk.Entry(ac1,textvariable=self.accel_device,width=12,state='readonly').pack(side=tk.LEFT,padx=(0,8))
@@ -1129,7 +1562,10 @@ class App:
         ttk.Combobox(ac1,textvariable=self.accel_fs_g,values=[2,4,8,16],state='readonly',width=5).pack(side=tk.LEFT,padx=(0,4))
         ttk.Label(ac1,text='g').pack(side=tk.LEFT,padx=(0,8))
         ttk.Label(ac1,text='ODR').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Combobox(ac1,textvariable=self.accel_odr_hz,values=[25,50,100,200,400,800],state='readonly',width=6).pack(side=tk.LEFT,padx=(0,2))
+        self.accel_odr_combo=ttk.Combobox(
+            ac1,textvariable=self.accel_odr_hz,values=[25,50,100,200,400,800],
+            state='readonly',width=6)
+        self.accel_odr_combo.pack(side=tk.LEFT,padx=(0,2))
         ttk.Label(ac1,text='Hz').pack(side=tk.LEFT,padx=(0,2))
 
         ac2=ttk.Frame(accel_cfg); ac2.pack(fill=tk.X,pady=2)
@@ -1159,17 +1595,32 @@ class App:
 
         ac6=ttk.Frame(accel_cfg); ac6.pack(fill=tk.X,pady=2)
         ttk.Label(ac6,text='Application pre-filter').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Combobox(ac6,textvariable=self.accel_prefilter,values=['None'],state='readonly',width=10).pack(side=tk.LEFT,padx=(0,10))
+        self.accel_prefilter_combo=ttk.Combobox(
+            ac6,textvariable=self.accel_prefilter,
+            values=['None','Issue 1 FIR 3.5-90 Hz'],state='readonly',width=22,
+        )
+        self.accel_prefilter_combo.pack(side=tk.LEFT,padx=(0,10))
         ttk.Label(ac6,text='FFT N').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Combobox(ac6,textvariable=self.accel_fft_n,values=[128,256,512,1024],state='readonly',width=7).pack(side=tk.LEFT,padx=(0,8))
+        self.accel_fft_n_combo=ttk.Combobox(
+            ac6,textvariable=self.accel_fft_n,values=[128,256,512,1024],
+            state='readonly',width=7)
+        self.accel_fft_n_combo.pack(side=tk.LEFT,padx=(0,8))
         ttk.Label(ac6,text='Window').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Combobox(ac6,textvariable=self.accel_fft_window,values=['Hann'],state='readonly',width=8).pack(side=tk.LEFT,padx=(0,8))
+        self.accel_window_combo=ttk.Combobox(
+            ac6,textvariable=self.accel_fft_window,values=['Hann'],
+            state='disabled',width=8)
+        self.accel_window_combo.pack(side=tk.LEFT,padx=(0,8))
 
         ac7=ttk.Frame(accel_cfg); ac7.pack(fill=tk.X,pady=2)
         ttk.Label(ac7,text='Overlap %').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Entry(ac7,textvariable=self.accel_fft_overlap,width=7).pack(side=tk.LEFT,padx=(0,8))
-        ttk.Label(ac7,text='PSD averages').pack(side=tk.LEFT,padx=(4,2))
-        ttk.Entry(ac7,textvariable=self.accel_psd_averages,width=6).pack(side=tk.LEFT,padx=(0,8))
+        self.accel_overlap_entry=ttk.Entry(
+            ac7,textvariable=self.accel_fft_overlap,width=7)
+        self.accel_overlap_entry.pack(side=tk.LEFT,padx=(0,8))
+        self.accel_ensemble_label=ttk.Label(ac7,text='PSD averages')
+        self.accel_ensemble_label.pack(side=tk.LEFT,padx=(4,2))
+        self.accel_averages_entry=ttk.Entry(
+            ac7,textvariable=self.accel_psd_averages,width=6)
+        self.accel_averages_entry.pack(side=tk.LEFT,padx=(0,8))
 
         ac8=ttk.Frame(accel_cfg); ac8.pack(fill=tk.X,pady=(3,1))
         ttk.Button(ac8,text='Apply processing settings',command=self.apply_accel_processing_settings).pack(side=tk.LEFT,padx=3)
@@ -1283,7 +1734,7 @@ The comparison workflow accepts both converted CSV files (time_s, X_g, Y_g, Z_g)
 
 Live K correction
 -----------------
-A complete live correction contains 14 frequency-band K = Base / Reader coefficients for each axis (42 coefficients total). Load either one combined CSV or multiple axis-specific exported correction CSVs. The correction is multiplicative and is applied after Gordon-band RMS integration; it is not a DC offset and does not alter the raw time-domain acceleration or tilt calculation. When enabled, corrected band values are used by the Live STM summary and live threshold decision. The Live K correction tab always shows raw versus corrected values for review.
+A complete live correction contains 14 frequency-band K = Base / Reader coefficients for each axis (42 coefficients total). Load either one combined CSV or multiple axis-specific exported correction CSVs. The correction is multiplicative and is applied after Gordon-band RMS integration; it is not a DC offset and does not alter the raw time-domain acceleration or tilt calculation. When enabled, translated band values are used by the Live STM summary and live threshold decision. The Live K correction tab always shows raw versus translated values for review.
 
 Baseline / reader correction workflow
 -------------------------------------
@@ -1291,10 +1742,23 @@ Load one Reader CSV containing X, Y and Z acceleration channels. Use Load baseli
 
 The normal mapping is X correction ← X baseline, Y ← Y baseline and Z ← Z baseline. If one baseline is unavailable, use Correction baseline mapping to explicitly select another loaded axis as a surrogate. When a surrogate is used, its driven-axis acceleration channel is used as the reference profile for the missing target axis; cross-axis response from that file is not used by mistake.
 
-Export derived correction creates one combined CSV containing 42 frequency-dependent K values (14 Gordon bands × X/Y/Z), together with source-axis/source-file metadata, fallback flags, the recommended model and the single-K candidate.
+Export derived correction creates a diagnostic 42-value correction from the currently loaded reader dataset. For the physical single-axis test-house workflow, use Store driven-axis K after each approved X-, Y- or Z-excited run, then Export final XYZ K to assemble the production candidate from the three separately driven-axis results with source traceability.
 
-Recommended default live settings
----------------------------------
+Selectable vibration methods
+----------------------------
+Issue 2 (default) retains the existing Welch PSD averaging and Gordon-band
+integration path. Issue 1 is a separate legacy/reference path: raw XYZ passes
+through a Hamming-designed 3.5-90 Hz FIR, then 19 overlapping 128-sample Hann
+FFTs are averaged as Fourier amplitudes. It does not average PSDs or integrate
+Gordon bands. The Gordon units selector can display those peak FFT-bin values
+and their matching limits as equivalent RMS acceleration, velocity or
+displacement; this is a unit conversion, not Issue 2 band integration. Use the
+dedicated offline or live Issue 1 FFT ensemble tab. The Translation function
+uses direct per-bin K = baseline ensemble amplitude / reader ensemble amplitude;
+it requires time-domain baseline captures and does not use Issue 2 model fitting.
+
+Recommended default Issue 2 live settings
+-----------------------------------------
 Device: LIS2DUX12
 Full-scale: ±2 g
 ODR: 200 Hz
@@ -1310,6 +1774,7 @@ PSD averages: 4
         txt.configure(state=tk.DISABLED)
 
     def _accelerometer_config_dict(self):
+        """Snapshot all sensor and host-processing controls in exportable form."""
         fs_g=int(self.accel_fs_g.get())
         odr=int(self.accel_odr_hz.get())
         sensitivity_mg_lsb=fs_g/32768.0*1000.0
@@ -1328,6 +1793,7 @@ PSD averages: 4
             'stream_timeout_ms':int(self.accel_stream_timeout_ms.get()),
             'nominal_sensitivity_mg_per_lsb':sensitivity_mg_lsb,
             'data_format':'signed int16 X/Y/Z',
+            'processing_method':self.processing_method.get(),
             'application_pre_filter':self.accel_prefilter.get(),
             'processing_rate_hz':odr,
             'fft_length':int(self.accel_fft_n.get()),
@@ -1336,6 +1802,108 @@ PSD averages: 4
             'psd_averages':int(self.accel_psd_averages.get()),
             'vibration_bands':'Gordon one-third-octave 4-80 Hz',
         }
+
+    def _processing_method_changed(self,event=None):
+        """Load the documented defaults for the selected software algorithm."""
+        method=self.processing_method.get()
+        if method==ISSUE1_METHOD:
+            self.accel_odr_hz.set(int(ISSUE1_SAMPLE_RATE_HZ))
+            self.accel_fft_n.set(ISSUE1_FFT_N)
+            self.accel_fft_window.set('Hann')
+            self.accel_fft_overlap.set(ISSUE1_OVERLAP*100.0)
+            self.accel_psd_averages.set(ISSUE1_ENSEMBLE_COUNT)
+            self.accel_prefilter.set('Issue 1 FIR 3.5-90 Hz')
+            self.accel_ensemble_label.configure(text='FFTs in ensemble')
+            self.processing_method_details.set(
+                'Issue 1 legacy/reference: 3.5–90 Hz Hamming FIR, 128-sample '
+                'Hann FFTs, 64-sample hop, 19-window amplitude ensemble, '
+                '1.5625 Hz resolution. Press Apply processing settings to activate.')
+        else:
+            self.accel_odr_hz.set(200)
+            self.accel_fft_n.set(512)
+            self.accel_fft_window.set('Hann')
+            self.accel_fft_overlap.set(50.0)
+            self.accel_psd_averages.set(4)
+            self.accel_prefilter.set('None')
+            self.accel_ensemble_label.configure(text='PSD averages')
+            self.processing_method_details.set(
+                'Issue 2: Welch PSD averaging and Gordon one-third-octave '
+                'integration. Press Apply processing settings to activate.')
+        self._sync_processing_method_controls()
+        self._update_processing_status()
+
+    def _display_units_changed(self,event=None):
+        """Refresh offline now and queue live plots after a unit-only change."""
+        if self.reader.loaded:
+            try:
+                self.plot_bands()
+                if any(p is not None and p.loaded for p in self.baselines.values()):
+                    self.plot_translation()
+            except Exception as exc:
+                self.status.set(f'Could not refresh selected display units: {exc}')
+        self.live_last_view_draw=0.0
+        self.live_redraw_pending=True
+
+    def _sync_processing_method_controls(self):
+        """Grey controls that do not participate in the selected method."""
+        issue1=self.processing_method.get()==ISSUE1_METHOD
+
+        # Issue 1 is the fixed document algorithm. Issue 2 retains the existing
+        # editable FFT/PSD controls. Hann and the mode-specific pre-filter are
+        # informative fixed values in both modes.
+        self.accel_odr_combo.configure(state='disabled' if issue1 else 'readonly')
+        self.accel_fft_n_combo.configure(state='disabled' if issue1 else 'readonly')
+        self.accel_overlap_entry.configure(state='disabled' if issue1 else 'normal')
+        self.accel_averages_entry.configure(state='disabled' if issue1 else 'normal')
+        self.accel_window_combo.configure(state='disabled')
+        self.accel_prefilter_combo.configure(state='disabled')
+        self.stage_block_combo.configure(state='disabled' if issue1 else 'readonly')
+        self.stage_block_label.configure(state='disabled' if issue1 else 'normal')
+        self.stage_explanation.configure(
+            text=('Issue 1 displays all 19 FFT amplitudes and their ensemble.'
+                  if issue1 else
+                  'Blocks are the overlapping segments used in the PSD average.'))
+
+        issue2_state='disabled' if issue1 else 'normal'
+        issue2_combo_state='disabled' if issue1 else 'readonly'
+        # Both algorithms can present their native result in equivalent RMS
+        # acceleration, velocity or displacement units.
+        self.units_combo.configure(state='readonly')
+        self.auto_crop_check.configure(state=issue2_state)
+        self.btn_export_correction.configure(state=issue2_state)
+        self.live_threshold_mode_combo.configure(state=issue2_combo_state)
+        self.live_threshold_apply_button.configure(state=issue2_state)
+        self.live_k_enable_check.configure(state=issue2_state)
+        self.live_k_load_button.configure(state=issue2_state)
+        self.live_k_clear_button.configure(state=issue2_state)
+        self._update_live_threshold_control_states()
+
+    def _sync_applied_mode_tabs(self):
+        """Enable analysis tabs belonging to the applied processing method."""
+        issue1=self._issue1_active()
+        issue1_tabs={'Issue 1 FFT ensemble','Live Issue 1 ensemble'}
+        issue2_tabs={
+            'PSD comparison','Transfer function',
+            'Live FFT + PSD','Live K correction',
+        }
+        for tab_id in self.tabs.tabs():
+            text=self.tabs.tab(tab_id,'text')
+            if text in issue1_tabs:
+                self.tabs.tab(tab_id,state='normal' if issue1 else 'disabled')
+            elif text in issue2_tabs:
+                reference_available=text=='PSD comparison' and (isinstance(self.reader,BaselineSpectrum) or any(isinstance(b,BaselineSpectrum) and b.loaded for b in self.baselines.values()))
+                self.tabs.tab(tab_id,state='disabled' if issue1 and not reference_available else 'normal')
+        selected=self.tabs.select()
+        if selected and str(self.tabs.tab(selected,'state'))=='disabled':
+            target='Calculation stages'
+            replacement=next(
+                (tab_id for tab_id in self.tabs.tabs()
+                 if self.tabs.tab(tab_id,'text')==target),None)
+            if replacement:
+                self.tabs.select(replacement)
+
+    def _issue1_active(self):
+        return self.applied_processing_method==ISSUE1_METHOD
 
     def _requested_accelerometer_wire_config(self):
         """Build and validate the firmware-facing subset of the controls."""
@@ -1353,6 +1921,7 @@ PSD averages: 4
         return requested
 
     def _begin_accelerometer_config_attempt(self,requested,message='CONFIGURE sent'):
+        """Track an asynchronous CONFIG request until ACK plus read-back arrive."""
         self.accel_config_attempt+=1
         attempt=self.accel_config_attempt
         self.accel_pending_config=requested
@@ -1425,18 +1994,50 @@ PSD averages: 4
         self.accel_config_ack_ok=False
         self._set_accel_program_result('failure','FAILED - TIMEOUT')
 
+    def _update_processing_status(self):
+        """Show the host settings most recently applied to live/offline analysis."""
+        if self._issue1_active():
+            hop=int(round(int(self.n.get())*(1-float(self.ov.get())/100.0)))
+            detail=(f'{int(self.segs.get())} FFT amplitudes | {hop}-sample hop | '
+                    f'FIR {ISSUE1_LOW_HZ:g}–{ISSUE1_HIGH_HZ:g} Hz')
+        else:
+            detail=f'{int(self.segs.get())} PSD averages'
+        self.processing_status.set(
+            f'Processing [{self.applied_processing_method}]: '
+            f'{float(self.fs.get()):g} Hz | FFT {int(self.n.get())} | Hann | '
+            f'{float(self.ov.get()):g}% overlap | {detail}'
+            + (f' | Selected: {self.processing_method.get()} — press Apply'
+               if self.processing_method.get()!=self.applied_processing_method else ''))
+
     def apply_accel_processing_settings(self):
         """Apply the host-side processing subset immediately."""
         try:
+            if self.processing_method.get()==ISSUE1_METHOD:
+                # Issue 1 is a deliberate fixed legacy/reference algorithm,
+                # rather than a request to run Issue 2 with 19 PSD averages.
+                self.accel_odr_hz.set(int(ISSUE1_SAMPLE_RATE_HZ))
+                self.accel_fft_n.set(ISSUE1_FFT_N)
+                self.accel_fft_window.set('Hann')
+                self.accel_fft_overlap.set(ISSUE1_OVERLAP*100.0)
+                self.accel_psd_averages.set(ISSUE1_ENSEMBLE_COUNT)
+                self.accel_prefilter.set('Issue 1 FIR 3.5-90 Hz')
             cfg=self._accelerometer_config_dict()
             self.fs.set(float(cfg['processing_rate_hz']))
             self.n.set(int(cfg['fft_length']))
             self.ov.set(float(cfg['fft_overlap_percent']))
             self.segs.set(int(cfg['psd_averages']))
+            self.applied_processing_method=cfg['processing_method']
+            if self.live_k_correction_enabled.get() and self.live_k_method not in (None,self.applied_processing_method):
+                self.live_k_correction_enabled.set(False)
+                self.live_k_status.set(
+                    f'Translation: loaded {self.live_k_method}, OFF — active processing is {self.applied_processing_method}')
+            self._update_processing_status()
+            self._sync_applied_mode_tabs()
             self.accel_config_status.set(
                 'Host processing updated. Sensor register programming is separate.')
-            if self.base.loaded and self.reader.loaded:
+            if self.reader.loaded:
                 self.refresh()
+            self._request_live_redraw()
         except Exception as exc:
             messagebox.showerror('Accelerometer configuration',str(exc))
 
@@ -1472,19 +2073,26 @@ PSD averages: 4
             'Live raw counts': 'Waiting for live samples. This view shows the exact signed int16 X/Y/Z counts supplied by SampleBlock.xyz.',
             'Live stages': 'Waiting for one complete FFT block to show each processing stage.',
             'Live FFT + PSD': 'Waiting for one complete FFT block to show spectral results.',
+            'Live Issue 1 ensemble': 'Select and apply Issue 1 mode, then capture 1,280 samples for the 19-FFT amplitude ensemble.',
             'Live K correction': 'Load X/Y/Z band-specific K factors to compare raw and translated Gordon-band values.',
             'Live threshold': 'Waiting for averaged PSD data to compare all axes with the selected vibration threshold.',
         }
         for name,message in descriptions.items():
             tab=ttk.Frame(self.tabs)
             self.tabs.add(tab,text=name)
-            if name in ('Live stages','Live FFT + PSD'):
+            if name in ('Live stages','Live FFT + PSD','Live Issue 1 ensemble'):
                 controls=ttk.Frame(tab,padding=(5,3)); controls.pack(fill=tk.X)
-                ttk.Label(controls,text='Axis' if name=='Live stages' else 'Phase axis').pack(side=tk.LEFT,padx=(2,2))
-                cb=ttk.Combobox(controls,textvariable=self.axis,values=list('XYZ'),state='readonly',width=5)
+                label=('Individual FFT axis' if name=='Live Issue 1 ensemble'
+                       else ('Axis' if name=='Live stages' else 'Phase axis'))
+                axis_var=(self.issue1_waterfall_axis if name=='Live Issue 1 ensemble' else self.axis)
+                ttk.Label(controls,text=label).pack(side=tk.LEFT,padx=(2,2))
+                cb=ttk.Combobox(controls,textvariable=axis_var,values=list('XYZ'),state='readonly',width=5)
                 cb.pack(side=tk.LEFT,padx=(0,10))
                 cb.bind('<<ComboboxSelected>>',lambda e:self._request_live_redraw())
-                ttk.Label(controls,text=('Processing-stage axis only.' if name=='Live stages' else 'Magnitude/PSD show X/Y/Z; selector controls the phase panel.')).pack(side=tk.LEFT,padx=4)
+                note=('19 individual filtered FFT amplitudes.' if name=='Live Issue 1 ensemble'
+                      else ('Processing-stage axis only.' if name=='Live stages'
+                            else 'Magnitude/PSD show X/Y/Z; selector controls the phase panel.'))
+                ttk.Label(controls,text=note).pack(side=tk.LEFT,padx=4)
             f=Figure(figsize=(10,6),dpi=100)
             canvas=FigureCanvasTkAgg(f,master=tab)
             canvas.get_tk_widget().pack(fill=tk.BOTH,expand=True)
@@ -1492,6 +2100,13 @@ PSD averages: 4
             tb.update(); tb.pack(fill=tk.X)
             self.live_analysis_fig[name]=(f,canvas)
             self._draw_live_analysis_empty(name,message)
+
+    def _request_live_redraw(self):
+        """Mark the selected live view stale after a processing-control change."""
+        self.live_last_view_draw=0.0
+        self.live_redraw_pending=True
+        if self.live_t:
+            self._refresh_visible_live_view()
 
     def _draw_live_analysis_empty(self,name,message):
         f,c=self._clear_live_analysis_figure(name)
@@ -1515,6 +2130,7 @@ PSD averages: 4
         f.tight_layout(); self.live_canvas.draw_idle()
 
     def live_refresh_ports(self):
+        """Refresh the COM-port selector while preserving a valid selection."""
         try:
             ports=available_serial_ports()
             values=[]
@@ -1538,6 +2154,7 @@ PSD averages: 4
         return text.split(' — ',1)[0].strip()
 
     def live_connect(self):
+        """Open the selected VCP on a worker thread to keep Tk responsive."""
         if self.live_connect_thread and self.live_connect_thread.is_alive():
             return
         port=self._selected_live_port()
@@ -1569,6 +2186,7 @@ PSD averages: 4
         self.live_connect_thread.start()
 
     def live_disconnect(self):
+        """Stop acquisition, close the VCP, and reset connection controls."""
         self.live_stop()
         th=self.live_thread
         if th and th.is_alive():
@@ -1589,6 +2207,7 @@ PSD averages: 4
         return value*(60.0 if self.operator_timeout_units.get()=='minutes' else 1.0)
 
     def _reset_capture_session_state(self):
+        """Initialise operator timeout, renewal, and recovery bookkeeping."""
         now=time.monotonic()
         self.capture_started_monotonic=now
         self.operator_period_started_monotonic=now
@@ -1599,6 +2218,7 @@ PSD averages: 4
         self.last_sample_block_monotonic=None; self.next_vmm_renewal_monotonic=None
 
     def live_start(self):
+        """Validate settings and launch the live serial polling worker."""
         if self.live_client is None:
             messagebox.showerror('Live capture','Open the ST-Link Virtual COM port first.')
             return
@@ -1711,6 +2331,7 @@ PSD averages: 4
         self.live_thread=threading.Thread(target=work,daemon=True); self.live_thread.start()
 
     def live_stop(self):
+        """Signal the worker to finish; final UI cleanup arrives via its queue."""
         self.live_stop_event.set()
         if self.live_capture.get() not in ('Stopped','Error'): self.live_capture.set('Stopping...')
 
@@ -1815,14 +2436,17 @@ PSD averages: 4
                 'effective_configuration':effective,
             },
             'processing_settings':{
-                'application_prefilter':self.accel_prefilter.get(),
+                'processing_method':self.applied_processing_method,
+                'application_prefilter':('Issue 1 FIR 3.5-90 Hz'
+                                         if self._issue1_active() else 'None'),
                 'sample_rate_hz':float(self.fs.get()),
                 'fft_length':int(self.n.get()),
                 'fft_window':self.accel_fft_window.get(),
                 'fft_overlap_percent':float(self.ov.get()),
                 'psd_averages':int(self.segs.get()),
+                'fft_ensemble_count':(int(self.segs.get()) if self._issue1_active() else None),
                 'gordon_units':self.units.get(),
-                'tilt_average_seconds':float(self.live_tilt_avg_seconds.get()),
+                'tilt_average_samples':int(self.tilt_average_samples.get()),
                 'shock_enabled':bool(self.live_shock_enabled.get()),
                 'shock_threshold_g':float(self.live_shock_threshold_g.get()),
                 'shock_steady_state_samples':int(self.live_shock_window_samples),
@@ -1898,11 +2522,15 @@ PSD averages: 4
             self._draw_live_analysis_empty(name,'Capture cleared. Start capture to display live data.')
 
     def _append_live_samples(self,arr,meta=None):
+        """Convert one raw sample block to g and append it to retained history."""
         meta=meta or {}
         period_us=int(meta.get('sample_period_us') or 0)
         odr_hz=float(meta.get('odr_hz') or 0)
         fs=(1e6/period_us) if period_us>0 else (odr_hz if odr_hz>0 else float(self.fs.get()))
         self.fs.set(fs)
+        # Live processing follows the measured block timing, as before; keep
+        # the read-only summary aligned with the value the calculations use.
+        self._update_processing_status()
         n=len(arr)
         timestamp_us=int(meta.get('timestamp_us') or 0)
         if timestamp_us>0 and period_us>0:
@@ -1961,6 +2589,7 @@ PSD averages: 4
         # the GUI scheduler, not once per incoming block.
 
     def _apply_accelerometer_readback(self,config):
+        """Compare firmware-effective configuration with the pending request."""
         self.accel_effective_config=config
         mode='High Performance' if config.high_performance else 'Low Power'
         bw=f'ODR/{config.bandwidth_divisor}'
@@ -2067,6 +2696,7 @@ PSD averages: 4
         win.protocol('WM_DELETE_WINDOW',lambda:finish(self._continue_timeout_period))
 
     def _check_operator_timeout(self):
+        """Handle user capture deadlines independently of the VMM lease timer."""
         if self.capture_started_monotonic is None or self.live_capture.get() not in ('Running','Running - no sample data'):
             return
         if not self.operator_timeout_enabled.get() or self.current_capture_indefinite:
@@ -2107,6 +2737,7 @@ PSD averages: 4
             f'Seq gaps {self.live_sequence_gaps} | Bad frames {self.live_bad_frames} | Raw log {raw}')
 
     def _poll_live_queue(self):
+        """Apply serial-worker events on Tk's main thread and schedule next poll."""
         redraw=False
         processed=0
         try:
@@ -2203,6 +2834,7 @@ PSD averages: 4
         self.root.after(25 if not self.live_queue.empty() else 100,self._poll_live_queue)
 
     def _refresh_visible_live_view(self):
+        """Redraw only the selected live tab to limit UI processing load."""
         """Refresh only the visible live figure at a human-readable rate."""
         if not self.live_t:
             return
@@ -2218,6 +2850,7 @@ PSD averages: 4
             'Live raw counts':self._update_live_raw_counts_plot,
             'Live stages':self._update_live_stage_plot,
             'Live FFT + PSD':self._update_live_spectrum_plot,
+            'Live Issue 1 ensemble':self._update_live_issue1_plot,
             'Live K correction':self._update_live_k_correction_plot,
             'Live threshold':self._update_live_threshold_plot,
         }
@@ -2228,7 +2861,7 @@ PSD averages: 4
         # Tilt benefits from a faster visual update. Multi-axis FFT/PSD and
         # threshold figures are expensive and gain nothing from redrawing more
         # frequently than once per second at a 200 Hz sample rate.
-        if selected in ('Live FFT + PSD','Live K correction','Live threshold','Live stages','Live raw counts'):
+        if selected in ('Live FFT + PSD','Live Issue 1 ensemble','Live K correction','Live threshold','Live stages','Live raw counts'):
             interval=1.0
         else:
             interval=0.5
@@ -2241,6 +2874,9 @@ PSD averages: 4
         self.live_redraw_pending=False
 
     def _live_welch(self,axis_values):
+        """Compute the configured live Welch PSD when enough samples exist."""
+        if self._issue1_active():
+            return None
         n=int(self.n.get()); ov=float(self.ov.get())/100.; segs=int(self.segs.get()); hop=int(round(n*(1-ov))); need=n+(segs-1)*hop
         if len(axis_values)<need: return None
         data=np.asarray(axis_values[-need:],float); ps=[]
@@ -2262,19 +2898,20 @@ PSD averages: 4
         return np.asarray(bands.v_rms_um_s,float),'RMS µm/s'
 
     def _live_k_complete(self):
-        return all(self.live_k_factors.get(axis) is not None for axis in 'XYZ')
+        return self.live_k_method is not None and self.live_k_coordinates is not None and all(self.live_k_factors.get(axis) is not None for axis in 'XYZ')
 
     def _on_live_k_toggle(self):
         if self.live_k_correction_enabled.get() and not self._live_k_complete():
             self.live_k_correction_enabled.set(False)
-            messagebox.showinfo(
-                'Live K correction',
-                'Load a complete set of 14 K factors for each of X, Y and Z before enabling live correction.'
-            )
+            messagebox.showinfo('Live translation','Load a complete X/Y/Z translation set before enabling live translation.')
+            return
+        if self.live_k_correction_enabled.get() and self.live_k_method!=self.applied_processing_method:
+            self.live_k_correction_enabled.set(False)
+            messagebox.showerror('Live translation method mismatch',f'Loaded translation uses {self.live_k_method}; active processing uses {self.applied_processing_method}.')
             return
         state='ON' if self.live_k_correction_enabled.get() else 'OFF'
         if self._live_k_complete():
-            self.live_k_status.set(f'K correction: {state}; 42 axis-band coefficients loaded')
+            self.live_k_status.set(f'Translation: {state}; {self.live_k_method}; {len(self.live_k_coordinates)} coefficients/axis')
         self.live_last_view_draw=0.0
         self.live_redraw_pending=True
         self._refresh_visible_live_view()
@@ -2282,95 +2919,101 @@ PSD averages: 4
     def clear_live_k_correction(self):
         self.live_k_correction_enabled.set(False)
         self.live_k_factors={axis:None for axis in 'XYZ'}
+        self.live_k_coordinates=None
+        self.live_k_method=None
         self.live_k_source_files=[]
-        self.live_k_status.set('K correction: not loaded')
+        self.live_k_status.set('Translation: not loaded')
         self.live_last_view_draw=0.0
         self.live_redraw_pending=True
         self._refresh_visible_live_view()
 
     def load_live_k_correction(self):
-        """Load one combined or multiple axis-specific K-factor CSV files."""
-        paths=filedialog.askopenfilenames(
-            title='Load X/Y/Z multi-frequency K-factor CSV(s)',
-            filetypes=[('CSV','*.csv'),('All files','*.*')]
-        )
-        if not paths:
-            return
-        collected={axis:{} for axis in 'XYZ'}
-        source_files=[]
+        """Load a complete Issue-1 or Issue-2 XYZ translation CSV set."""
+        paths=filedialog.askopenfilenames(title='Load X/Y/Z translation CSV(s)',filetypes=[('CSV','*.csv'),('All files','*.*')])
+        if not paths: return
+        collected={axis:{} for axis in 'XYZ'}; source_files=[]; methods=set()
         try:
             for path in paths:
                 df=pd.read_csv(path)
                 cols={str(c).strip().lower():c for c in df.columns}
+                method_col=cols.get('processing_method') or cols.get('method')
+                if method_col is None:
+                    file_methods={ISSUE2_METHOD}
+                else:
+                    file_methods={str(v).strip() for v in df[method_col].dropna().unique()}
+                if len(file_methods)!=1: raise ValueError(f'{Path(path).name}: translation file contains mixed processing methods.')
+                method=next(iter(file_methods)); methods.add(method)
                 axis_col=cols.get('axis') or cols.get('driven_axis')
-                fc_col=cols.get('fc_hz') or cols.get('frequency_hz') or cols.get('band_hz')
-                k_col=(cols.get('k_base_over_reader') or cols.get('k') or
-                       cols.get('k_factor') or cols.get('correction_factor'))
-                if fc_col is None or k_col is None:
-                    raise ValueError(
-                        f'{Path(path).name}: expected fc_hz and K_base_over_reader (or K/K_factor/correction_factor).'
-                    )
+                coord_col=(cols.get('frequency_hz') if method==ISSUE1_METHOD else (cols.get('fc_hz') or cols.get('band_hz') or cols.get('frequency_hz')))
+                k_col=cols.get('k_base_over_reader') or cols.get('k') or cols.get('k_factor') or cols.get('correction_factor')
+                if coord_col is None or k_col is None:
+                    raise ValueError(f'{Path(path).name}: expected coordinate and K_base_over_reader columns.')
                 if axis_col is None:
-                    name=Path(path).stem.upper()
-                    hits=[]
+                    name=Path(path).stem.upper(); hits=[]
                     for axis in 'XYZ':
-                        token=f'_{axis}_'
                         padded=f'_{name}_'
-                        if token in padded or name.startswith(axis+'_') or name.endswith('_'+axis):
-                            hits.append(axis)
-                    if len(hits)!=1:
-                        raise ValueError(f'{Path(path).name}: no axis/driven_axis column and axis is not unambiguous in filename.')
+                        if f'_{axis}_' in padded or name.startswith(axis+'_') or name.endswith('_'+axis): hits.append(axis)
+                    if len(hits)!=1: raise ValueError(f'{Path(path).name}: axis/driven_axis column is required when filename is ambiguous.')
                     axes=np.full(len(df),hits[0],dtype=object)
                 else:
                     axes=df[axis_col].astype(str).str.strip().str.upper().to_numpy()
-                fcs=pd.to_numeric(df[fc_col],errors='coerce').to_numpy(float)
+                coords=pd.to_numeric(df[coord_col],errors='coerce').to_numpy(float)
                 ks=pd.to_numeric(df[k_col],errors='coerce').to_numpy(float)
-                for axis,fc,k in zip(axes,fcs,ks):
-                    if axis not in ('X','Y','Z'):
-                        raise ValueError(f'{Path(path).name}: invalid axis value {axis!r}.')
-                    if not np.isfinite(fc) or not np.isfinite(k) or k<=0:
-                        raise ValueError(f'{Path(path).name}: invalid frequency/K value ({fc}, {k}).')
-                    j=int(np.argmin(np.abs(GORDON_FC-fc)))
-                    if abs(float(GORDON_FC[j])-float(fc))>0.11:
-                        raise ValueError(f'{Path(path).name}: {fc:g} Hz is not a supported Gordon centre frequency.')
-                    key=float(GORDON_FC[j])
-                    if key in collected[axis] and not np.isclose(collected[axis][key],k,rtol=1e-6,atol=1e-9):
-                        raise ValueError(f'Conflicting K values supplied for {axis} at {key:g} Hz.')
-                    collected[axis][key]=float(k)
+                for axis,coord,k in zip(axes,coords,ks):
+                    if axis not in 'XYZ' or not np.isfinite(coord) or not np.isfinite(k) or k<=0:
+                        raise ValueError(f'{Path(path).name}: invalid axis/coordinate/K row.')
+                    collected[axis][round(float(coord),9)]=float(k)
                 source_files.append(Path(path).name)
-
-            missing=[]
+            if len(methods)!=1: raise ValueError('Cannot load a translation set containing both Issue 1 and Issue 2 data.')
+            method=next(iter(methods))
+            expected=(np.asarray(GORDON_FC,float) if method==ISSUE2_METHOD else np.fft.rfftfreq(ISSUE1_FFT_N,1.0/ISSUE1_SAMPLE_RATE_HZ))
+            if method==ISSUE1_METHOD:
+                expected=expected[(expected>=ISSUE1_LOW_HZ)&(expected<=ISSUE1_HIGH_HZ)]
             factors={}
             for axis in 'XYZ':
                 vals=[]
-                for fc in GORDON_FC:
-                    key=float(fc)
-                    if key not in collected[axis]:
-                        missing.append(f'{axis} {fc:g} Hz')
-                    else:
-                        vals.append(collected[axis][key])
-                factors[axis]=np.asarray(vals,float) if len(vals)==len(GORDON_FC) else None
-            if missing:
-                raise ValueError('Incomplete K-factor set. Missing: '+', '.join(missing))
-
+                for coord in expected:
+                    key=round(float(coord),9)
+                    if key not in collected[axis]: raise ValueError(f'Incomplete {method} translation: missing {axis} at {coord:g} Hz.')
+                    vals.append(collected[axis][key])
+                factors[axis]=np.asarray(vals,float)
+            self.live_k_method=method
+            self.live_k_coordinates=np.asarray(expected,float)
             self.live_k_factors=factors
             self.live_k_source_files=source_files
-            self.live_k_status.set(f'K correction: loaded 42 coefficients from {len(source_files)} file(s); OFF')
             self.live_k_correction_enabled.set(False)
-            self.live_last_view_draw=0.0
-            self.live_redraw_pending=True
-            self.status.set('Loaded live X/Y/Z multi-frequency K correction coefficients.')
+            self.live_k_status.set(f'Translation: loaded {method}, {len(expected)} coefficients/axis; OFF')
+            self.status.set(f'Loaded complete XYZ {method} live translation set.')
+            self.live_last_view_draw=0.0; self.live_redraw_pending=True
         except Exception as exc:
-            messagebox.showerror('Load K factors',str(exc))
+            messagebox.showerror('Load translation',str(exc))
 
     def _apply_live_k(self,axis,values,force=False):
-        """Apply Base/Reader K after band integration; raw time samples are never modified."""
+        """Apply Issue-2 K after Gordon-band integration; raw samples stay unchanged."""
         arr=np.asarray(values,float)
-        if not self._live_k_complete():
+        if not self._live_k_complete() or self.live_k_method!=ISSUE2_METHOD:
             return arr.copy()
         if not force and not self.live_k_correction_enabled.get():
             return arr.copy()
         return arr*np.asarray(self.live_k_factors[axis],float)
+
+    def _apply_issue1_translation_result(self,result,force=False):
+        """Return an Issue1Result with loaded K applied at Issue-1 FFT coordinates."""
+        if not self._live_k_complete() or self.live_k_method!=ISSUE1_METHOD:
+            return result
+        if not force and not self.live_k_correction_enabled.get():
+            return result
+        ensemble=np.asarray(result.ensemble_amplitude_g,float).copy()
+        coords=np.asarray(self.live_k_coordinates,float)
+        for ai,axis in enumerate('XYZ'):
+            for coord,k in zip(coords,self.live_k_factors[axis]):
+                idx=int(np.argmin(np.abs(result.frequency_hz-float(coord))))
+                if abs(float(result.frequency_hz[idx])-float(coord))<1e-6:
+                    ensemble[ai,idx]*=float(k)
+        exceeded=ensemble>result.threshold_amplitude_g[None,:]
+        ratio=np.divide(ensemble,result.threshold_amplitude_g[None,:],out=np.zeros_like(ensemble),where=np.isfinite(result.threshold_amplitude_g[None,:])&(result.threshold_amplitude_g[None,:]>0))
+        flat=int(np.argmax(ratio)); ai,bi=np.unravel_index(flat,ratio.shape)
+        return replace(result,ensemble_amplitude_g=ensemble,exceeded=exceeded,worst_axis='XYZ'[ai],worst_frequency_hz=float(result.frequency_hz[bi]),worst_measured_g=float(ensemble[ai,bi]),worst_threshold_g=float(result.threshold_amplitude_g[bi]),worst_ratio=float(ratio[ai,bi]))
 
     def _live_threshold_limit(self):
         mode=self.live_threshold_mode.get()
@@ -2418,8 +3061,9 @@ PSD averages: 4
 
     def _update_live_threshold_control_states(self):
         mode=self.live_threshold_mode.get()
-        gordon_enabled=mode=='Gordon Office'
-        fixed_enabled=mode.startswith('Fixed ')
+        issue2_selected=self.processing_method.get()!=ISSUE1_METHOD
+        gordon_enabled=issue2_selected and mode=='Gordon Office'
+        fixed_enabled=issue2_selected and mode.startswith('Fixed ')
         self.live_threshold_multiplier_entry.configure(state='normal' if gordon_enabled else 'disabled')
         self.live_threshold_multiplier_label.configure(state='normal' if gordon_enabled else 'disabled')
         self.live_threshold_value_entry.configure(state='normal' if fixed_enabled else 'disabled')
@@ -2497,8 +3141,12 @@ PSD averages: 4
             need=n+(segs-1)*hop
             available=min(len(self.live_x),len(self.live_y),len(self.live_z))
             ax_b.axis('off')
-            ax_b.text(.5,.5,f'Waiting for PSD data\n{available} / {need} samples',ha='center',va='center')
-            self.live_threshold_status.set(f'Threshold: waiting for PSD data ({available} / {need} samples)')
+            if self._issue1_active():
+                ax_b.text(.5,.5,'Issue 2 Gordon-band summary inactive\nUse Live Issue 1 ensemble',ha='center',va='center')
+                self.live_threshold_status.set('Issue 2 threshold inactive in Issue 1 mode')
+            else:
+                ax_b.text(.5,.5,f'Waiting for PSD data\n{available} / {need} samples',ha='center',va='center')
+                self.live_threshold_status.set(f'Threshold: waiting for PSD data ({available} / {need} samples)')
         else:
             plotted={}
             ylabel=None
@@ -2507,7 +3155,7 @@ PSD averages: 4
                 q=self._apply_live_k(axis,raw_q)
                 plotted[axis]=q
                 ylabel=yl
-                suffix=' corrected' if self.live_k_correction_enabled.get() and self._live_k_complete() else ''
+                suffix=' translated' if self.live_k_correction_enabled.get() and self._live_k_complete() else ''
                 ax_b.semilogx(GORDON_FC,q,marker='o',label=f'{axis} axis{suffix}')
 
             threshold=self._live_threshold_limit()
@@ -2529,7 +3177,7 @@ PSD averages: 4
                     f'{GORDON_FC[worst_band]:g} Hz = {worst_ratio:.2f}× limit')
 
             set_gordon_xaxis(ax_b,rotate=45)
-            ax_b.set(title=('Live X / Y / Z Gordon bands - K corrected' if self.live_k_correction_enabled.get() and self._live_k_complete() else 'Live X / Y / Z Gordon bands - raw reader'),xlabel='Band centre (Hz)',ylabel=ylabel)
+            ax_b.set(title=('Live X / Y / Z Gordon bands - translated' if self.live_k_correction_enabled.get() and self._live_k_complete() else 'Live X / Y / Z Gordon bands - raw reader'),xlabel='Band centre (Hz)',ylabel=ylabel)
             ax_b.grid(True,which='both')
             ax_b.legend(fontsize=8)
 
@@ -2565,6 +3213,7 @@ PSD averages: 4
             self._update_live_plot()
 
     def _live_shock_series(self, nview=None):
+        """Return moving-baseline resultant shock magnitude for retained samples."""
         """Return time and Issue-2 shock magnitude for the live XYZ stream.
 
         1174-Y-056 Proposed Issue 2 section 6.2.2 defines shock as the
@@ -2660,6 +3309,7 @@ PSD averages: 4
             f'events {self.live_shock_events}; threshold {threshold:g} g')
 
     def _current_live_tilt(self):
+        """Estimate roll/pitch only when the averaged vector resembles gravity."""
         """
         Estimate tilt from the low-frequency gravity vector.
 
@@ -2671,8 +3321,8 @@ PSD averages: 4
             return None
 
         fs=float(self.fs.get())
-        avg_s=max(0.25,float(self.live_tilt_avg_seconds.get()))
-        navg=max(1,int(round(avg_s*fs)))
+        navg=max(1,int(self.tilt_average_samples.get()))
+        avg_s=navg/fs
 
         # Do not let the averaging window "grow in" from 1 sample. That caused
         # the first automatic zero reference to be based on an unstable partial
@@ -2861,6 +3511,7 @@ PSD averages: 4
         return flags
 
     def _raw_stream_diagnostics(self):
+        """Summarise VMM sequence, timing, and status health from raw metadata."""
         if not self.live_raw_x:
             return None
         fs=float(self.fs.get())
@@ -2969,7 +3620,172 @@ PSD averages: 4
         )
         f.tight_layout(); c.draw_idle()
 
+    def _draw_issue1_result(self,f,c,result,title,fs,selected_axis=None):
+        """Render filtered data, individual FFTs, ensemble, and threshold result."""
+        f.clear(); axs=f.subplots(2,2)
+        first=int(result.window_starts[0])
+        last=int(result.window_starts[-1])+ISSUE1_FFT_N
+        filtered=result.filtered_xyz_g[first:last]
+        time_axis=np.arange(len(filtered),dtype=float)/float(fs)
+        colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}
+        for axis_i,axis_name in enumerate('XYZ'):
+            axs[0,0].plot(time_axis,filtered[:,axis_i],color=colours[axis_name],
+                          linewidth=.8,label=axis_name)
+        axs[0,0].set(title='Issue 1 FIR-filtered time history',xlabel='Ensemble time (s)',ylabel='Acceleration (g)')
+        axs[0,0].legend(ncol=3)
+
+        selected=selected_axis or self.issue1_waterfall_axis.get()
+        selected_i='XYZ'.index(selected)
+        active=(result.frequency_hz>=ISSUE1_LOW_HZ)&(result.frequency_hz<=ISSUE1_HIGH_HZ)
+        for index,amplitude in enumerate(result.individual_amplitude_g[:,selected_i,:],start=1):
+            axs[0,1].plot(result.frequency_hz[active],amplitude[active],alpha=.35,
+                          linewidth=.75,label='Individual FFTs' if index==1 else None)
+        axs[0,1].set(title=f'{selected}: 19 individual FFT amplitudes',xlabel='Frequency (Hz)',ylabel='Peak amplitude (g)')
+        axs[0,1].legend(fontsize=8)
+
+        for axis_i,axis_name in enumerate('XYZ'):
+            measured=result.ensemble_amplitude_g[axis_i]
+            axs[1,0].semilogy(result.frequency_hz[active],np.maximum(measured[active],1e-12),
+                              color=colours[axis_name],label=f'{axis_name} ensemble')
+            exceeded=result.exceeded[axis_i]&active
+            if np.any(exceeded):
+                axs[1,0].scatter(result.frequency_hz[exceeded],measured[exceeded],
+                                 color='tab:red',edgecolor='black',s=35,zorder=5)
+        axs[1,0].semilogy(
+            result.frequency_hz[active],result.threshold_amplitude_g[active],
+            color='black',linestyle='--',linewidth=1.5,label='Issue 1 derived threshold')
+        axs[1,0].set(title='Ensemble-averaged Fourier amplitude',xlabel='Frequency (Hz)',ylabel='Peak amplitude (g)')
+        axs[1,0].legend(fontsize=8)
+
+        axs[1,1].axis('off')
+        state='EXCEEDED' if np.any(result.exceeded) else 'PASS'
+        axs[1,1].text(
+            .04,.92,
+            f'{state}\n\n'
+            f'Worst axis: {result.worst_axis}\n'
+            f'Worst frequency: {result.worst_frequency_hz:g} Hz\n'
+            f'Measured FFT amplitude: {result.worst_measured_g:.6g} g peak\n'
+            f'Threshold FFT amplitude: {result.worst_threshold_g:.6g} g peak\n'
+            f'Measured / threshold: {result.worst_ratio:.3f}×\n\n'
+            f'Frequency resolution: {float(fs)/ISSUE1_FFT_N:g} Hz\n'
+            f'Windows: {len(result.window_starts)}; hop: '
+            f'{int(result.window_starts[1]-result.window_starts[0])} samples',
+            transform=axs[1,1].transAxes,va='top',fontsize=11,
+        )
+        for ax in (axs[0,0],axs[0,1],axs[1,0]):
+            ax.grid(True,which='both')
+            ax.set_xlim(ISSUE1_LOW_HZ,ISSUE1_HIGH_HZ) if ax is not axs[0,0] else None
+        f.suptitle(title)
+        f.tight_layout(); c.draw_idle()
+
+    def _issue1_display_values(self,peak_acceleration_g,frequency_hz):
+        """Convert Issue 1 peak FFT amplitudes to the selected RMS units."""
+        frequency=np.asarray(frequency_hz,float)
+        acceleration_rms_g=np.asarray(peak_acceleration_g,float)/np.sqrt(2.0)
+        if self.units.get()=='RMS acceleration (g)':
+            return acceleration_rms_g,'RMS g (per FFT bin)','g RMS'
+        velocity_rms_um_s=np.divide(
+            acceleration_rms_g*G0*1e6,2*np.pi*frequency,
+            out=np.full_like(acceleration_rms_g,np.nan),where=frequency>0)
+        if self.units.get()=='RMS displacement (µm)':
+            displacement_rms_um=np.divide(
+                velocity_rms_um_s,2*np.pi*frequency,
+                out=np.full_like(velocity_rms_um_s,np.nan),where=frequency>0)
+            return displacement_rms_um,'RMS µm (per FFT bin)','µm RMS'
+        return velocity_rms_um_s,'RMS µm/s (per FFT bin)','µm/s RMS'
+
+    def _draw_issue1_gordon_comparison(self,f,c,result,title):
+        """Draw the legacy calculation using the Issue 2 comparison layout.
+
+        The single combined axes is deliberately only a presentation change:
+        Issue 1 still compares ensemble Fourier amplitudes at FFT-bin
+        frequencies, rather than integrating a Welch PSD into Gordon bands.
+        """
+        f.clear(); ax=f.add_subplot(111)
+        active=np.isfinite(result.threshold_amplitude_g)&(result.frequency_hz>0)
+        frequency=np.asarray(result.frequency_hz[active],float)
+        threshold,yl,summary_unit=self._issue1_display_values(
+            result.threshold_amplitude_g[active],frequency)
+        colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}
+        exceeded_labelled=False
+        displayed={}
+        for axis_i,axis_name in enumerate('XYZ'):
+            measured,_,_=self._issue1_display_values(
+                result.ensemble_amplitude_g[axis_i,active],frequency)
+            displayed[axis_name]=measured
+            ax.semilogx(frequency,measured,
+                        color=colours[axis_name],marker='o',linestyle='-',
+                        label=f'Reader {axis_name}')
+            exceeded=result.exceeded[axis_i]&active
+            if np.any(exceeded):
+                ax.scatter(result.frequency_hz[exceeded],
+                           measured[result.exceeded[axis_i,active]],
+                           color='tab:red',edgecolor='black',s=42,zorder=5,
+                           label='Exceeded' if not exceeded_labelled else None)
+                exceeded_labelled=True
+        ax.semilogx(
+            frequency,threshold,
+            marker='s',color='0.25',linewidth=1.5,
+            label='Gordon Office — Issue 1 Fourier limit')
+        # Reuse the Gordon-centre tick layout from the Issue 2 comparison;
+        # measured points remain at their actual Issue 1 FFT-bin frequencies.
+        set_gordon_xaxis(ax,rotate=45)
+        ax.set_xlabel('FFT frequency bin (Hz)')
+        ax.set_ylabel(yl)
+        state='EXCEEDED' if np.any(result.exceeded) else 'PASS'
+        worst_index=int(np.argmin(np.abs(frequency-result.worst_frequency_hz)))
+        worst_measured=float(displayed[result.worst_axis][worst_index])
+        worst_threshold=float(threshold[worst_index])
+        ax.set_title(
+            f'{title} — {self.units.get()}\n'
+            f'{state}: worst reader {result.worst_axis} at '
+            f'{result.worst_frequency_hz:g} Hz; {worst_measured:.6g} / '
+            f'{worst_threshold:.6g} {summary_unit} = {result.worst_ratio:.3f}×')
+        ax.grid(True,which='both'); ax.legend(ncol=2,fontsize=8)
+        f.tight_layout(); c.draw_idle()
+
+    def _update_live_issue1_plot(self):
+        name='Live Issue 1 ensemble'
+        if not self._issue1_active():
+            self._draw_live_analysis_empty(
+                name,'Issue 1 is not active. Select it in Accelerometer / processing configuration and press Apply processing settings.')
+            return
+        required=issue1_required_samples()
+        available=min(len(self.live_x),len(self.live_y),len(self.live_z))
+        if available<required:
+            self._draw_live_analysis_empty(name,f'Waiting for Issue 1 ensemble data: {available} / {required} samples.')
+            return
+        xyz=np.column_stack((self.live_x,self.live_y,self.live_z))
+        start=len(xyz)-required
+        try:
+            result=issue1_ensemble_fft(xyz,float(self.fs.get()),start=start)
+            result=self._apply_issue1_translation_result(result)
+        except Exception as exc:
+            self._draw_live_analysis_empty(name,f'Issue 1 processing unavailable: {exc}')
+            return
+        f,c=self._clear_live_analysis_figure(name)
+        translated='translated environmental estimate' if self.live_k_correction_enabled.get() and self.live_k_method==ISSUE1_METHOD else 'raw reader response'
+        self._draw_issue1_result(f,c,result,f'Live Issue 1 {translated}',float(self.fs.get()))
+
     def _update_live_stage_plot(self):
+        if self._issue1_active():
+            name='Live stages'; required=issue1_required_samples()
+            available=min(len(self.live_x),len(self.live_y),len(self.live_z))
+            if available<required:
+                self._draw_live_analysis_empty(name,f'Waiting for Issue 1 calculation stages: {available} / {required} samples.')
+                return
+            xyz=np.column_stack((self.live_x,self.live_y,self.live_z))
+            result=issue1_ensemble_fft(xyz,float(self.fs.get()),start=len(xyz)-required)
+            result=self._apply_issue1_translation_result(result)
+            state='EXCEEDED' if np.any(result.exceeded) else 'PASS'
+            self.live_threshold_status.set(
+                f'{state}: Issue 1 worst {result.worst_axis} '
+                f'{result.worst_frequency_hz:g} Hz = {result.worst_ratio:.2f}× limit')
+            f,c=self._clear_live_analysis_figure(name)
+            self._draw_issue1_result(
+                f,c,result,'Live Issue 1 calculation stages',float(self.fs.get()),
+                selected_axis=self.axis.get())
+            return
         name='Live stages'; n=int(self.n.get()); fs=float(self.fs.get())
         axis_name=self.axis.get(); values={'X':self.live_x,'Y':self.live_y,'Z':self.live_z}[axis_name]
         if len(values)<n:
@@ -2990,6 +3806,9 @@ PSD averages: 4
         f.tight_layout(); c.draw_idle()
 
     def _update_live_spectrum_plot(self):
+        if self._issue1_active():
+            self._draw_live_analysis_empty('Live FFT + PSD','Issue 2 FFT/PSD diagnostics are inactive. Use Live Issue 1 ensemble.')
+            return
         name='Live FFT + PSD'; n=int(self.n.get()); fs=float(self.fs.get())
         if min(len(self.live_x),len(self.live_y),len(self.live_z))<n:
             have=min(len(self.live_x),len(self.live_y),len(self.live_z))
@@ -3030,6 +3849,29 @@ PSD averages: 4
 
     def _update_live_k_correction_plot(self):
         name='Live K correction'
+        if self._issue1_active():
+            if not self._live_k_complete() or self.live_k_method!=ISSUE1_METHOD:
+                self._draw_live_analysis_empty(name,'Load a complete Issue 1 XYZ translation set to compare raw reader response with the translated environmental estimate.')
+                return
+            required=issue1_required_samples(); available=min(len(self.live_x),len(self.live_y),len(self.live_z))
+            if available<required:
+                self._draw_live_analysis_empty(name,f'Waiting for Issue 1 ensemble data: {available} / {required} samples.')
+                return
+            xyz=np.column_stack((self.live_x,self.live_y,self.live_z))
+            raw=issue1_ensemble_fft(xyz,float(self.fs.get()),start=len(xyz)-required)
+            translated=self._apply_issue1_translation_result(raw,force=True)
+            active=(raw.frequency_hz>=ISSUE1_LOW_HZ)&(raw.frequency_hz<=ISSUE1_HIGH_HZ)
+            f,c=self._clear_live_analysis_figure(name); axs=f.subplots(3,1,sharex=True)
+            for ai,(axis,ax) in enumerate(zip('XYZ',axs)):
+                raw_v,yl,_=self._issue1_display_values(raw.ensemble_amplitude_g[ai,active],raw.frequency_hz[active])
+                tr_v,_,_=self._issue1_display_values(translated.ensemble_amplitude_g[ai,active],raw.frequency_hz[active])
+                ax.semilogx(raw.frequency_hz[active],raw_v,marker='o',label=f'Raw reader {axis}')
+                ax.semilogx(raw.frequency_hz[active],tr_v,marker='x',linestyle='--',label=f'Translated {axis}')
+                ax.set_ylabel(f'{axis}: {yl}'); ax.grid(True,which='both'); ax.legend(fontsize=8)
+            axs[-1].set_xlabel('Issue 1 FFT frequency (Hz)')
+            f.suptitle('Live Issue 1 translation — raw reader response vs translated environmental estimate')
+            f.tight_layout(); c.draw_idle()
+            return
         if not self._live_k_complete():
             self._draw_live_analysis_empty(
                 name,
@@ -3052,7 +3894,7 @@ PSD averages: 4
         axs=f.subplots(3,1,sharex=True)
         for ax,(axis_name,raw,corrected,yl) in zip(axs,results):
             ax.semilogx(GORDON_FC,raw,marker='o',label=f'Raw reader {axis_name}')
-            ax.semilogx(GORDON_FC,corrected,marker='x',linestyle='--',label=f'After K correction {axis_name}')
+            ax.semilogx(GORDON_FC,corrected,marker='x',linestyle='--',label=f'Translated {axis_name}')
             ax.set_ylabel(f'{axis_name}: {yl}')
             ax.grid(True,which='both')
             ax.legend(fontsize=8,loc='best')
@@ -3065,6 +3907,23 @@ PSD averages: 4
 
     def _update_live_threshold_plot(self):
         name='Live threshold'
+        if self._issue1_active():
+            required=issue1_required_samples()
+            available=min(len(self.live_x),len(self.live_y),len(self.live_z))
+            if available<required:
+                self._draw_live_analysis_empty(name,f'Waiting for Issue 1 Gordon comparison: {available} / {required} samples.')
+                return
+            xyz=np.column_stack((self.live_x,self.live_y,self.live_z))
+            result=issue1_ensemble_fft(xyz,float(self.fs.get()),start=len(xyz)-required)
+            result=self._apply_issue1_translation_result(result)
+            state='EXCEEDED' if np.any(result.exceeded) else 'PASS'
+            self.live_threshold_status.set(
+                f'{state}: Issue 1 worst {result.worst_axis} '
+                f'{result.worst_frequency_hz:g} Hz = {result.worst_ratio:.2f}× limit')
+            f,c=self._clear_live_analysis_figure(name)
+            self._draw_issue1_gordon_comparison(
+                f,c,result,'Live Issue 1 Fourier-amplitude comparison with Gordon Office')
+            return
         threshold=self._live_threshold_limit()
         if threshold is None:
             message=('Threshold overlay is disabled.' if self.live_threshold_mode.get()=='Off'
@@ -3084,29 +3943,64 @@ PSD averages: 4
             values_for_units=self._apply_live_k(axis_name,values_for_units)
             results.append((axis_name,values_for_units,yl))
 
-        f,c=self._clear_live_analysis_figure(name); axs=f.subplots(3,1,sharex=True)
+        # Put all three axes on one threshold graph.  This makes the live
+        # decision much easier to read than three stacked plots and keeps the
+        # axis colours consistent with the rest of the application.
+        f,c=self._clear_live_analysis_figure(name)
+        ax=f.add_subplot(111)
+        colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}
+        k_active=bool(self.live_k_correction_enabled.get() and self._live_k_complete())
         worst_ratio=-1.0; worst_axis=''; worst_band=0.0; total_exceeded=0
-        for ax,(axis_name,measured,yl) in zip(axs,results):
+        ylabel=results[0][2] if results else self.units.get()
+
+        # When live K correction is active, show the uncorrected reader result
+        # as a light dashed reference and the corrected values as the solid
+        # X/Y/Z traces used for the actual threshold decision.
+        for axis_name,measured,yl in results:
+            raw_bands=self._live_welch_bands({'X':self.live_x,'Y':self.live_y,'Z':self.live_z}[axis_name])
+            raw_display,_=self._band_values_for_units(raw_bands)
+            if k_active:
+                ax.semilogx(
+                    GORDON_FC,raw_display,color=colours[axis_name],linestyle='--',
+                    linewidth=1.0,alpha=.35,label=f'{axis_name} raw')
+
             ratio=np.divide(measured,limit,out=np.zeros_like(measured),where=limit>0)
             exceeded=measured>limit; total_exceeded+=int(np.sum(exceeded))
             idx=int(np.argmax(ratio))
             if ratio[idx]>worst_ratio:
                 worst_ratio=float(ratio[idx]); worst_axis=axis_name; worst_band=float(GORDON_FC[idx])
-            ax.semilogx(GORDON_FC,measured,marker='o',label=f'Live {axis_name}')
-            ax.semilogx(GORDON_FC,limit,marker='s',label=threshold_label)
+            label=f'{axis_name} translated' if k_active else f'{axis_name} raw'
+            ax.semilogx(
+                GORDON_FC,measured,color=colours[axis_name],marker='o',
+                linewidth=1.8,label=label)
             if np.any(exceeded):
-                ax.scatter(GORDON_FC[exceeded],measured[exceeded],s=55,color='tab:red',edgecolor='black',zorder=5,label='Exceeded')
-            ax.set_ylabel(f'{axis_name}: {yl}'); ax.grid(True,which='both'); ax.legend(fontsize=8,loc='best')
-            set_gordon_xaxis(ax,rotate=0)
-        axs[-1].set_xlabel('One-third-octave band centre (Hz)')
+                ax.scatter(
+                    GORDON_FC[exceeded],measured[exceeded],s=55,
+                    color=colours[axis_name],edgecolor='black',zorder=5)
+
+        ax.semilogx(
+            GORDON_FC,limit,marker='s',color='0.20',linewidth=1.8,
+            linestyle='-',label=threshold_label)
+        set_gordon_xaxis(ax,rotate=45)
+        ax.set_xlabel('One-third-octave band centre (Hz)')
+        ax.set_ylabel(ylabel)
+        ax.grid(True,which='both')
+        ax.legend(fontsize=8,ncol=2,loc='best')
+
         state='EXCEEDED' if total_exceeded else 'PASS'
+        correction_text='translated' if k_active else 'raw reader'
         self.live_threshold_status.set(
-            f'{state}: {total_exceeded}/42 axis-bands; worst {worst_axis} {worst_band:g} Hz = {worst_ratio:.2f}× limit'
+            f'{state}: {total_exceeded}/42 axis-bands; worst {worst_axis} {worst_band:g} Hz = {worst_ratio:.2f}× limit; '
+            f'threshold decision uses {correction_text} data'
         )
-        f.suptitle(f"Live vibration threshold overlay - {threshold_label}{' - K corrected' if self.live_k_correction_enabled.get() and self._live_k_complete() else ''}")
+        ax.set_title(
+            f'Live X / Y / Z against {threshold_label} - {correction_text}\n'
+            f'{state}: worst {worst_axis} {worst_band:g} Hz = {worst_ratio:.2f}× limit')
+        f.tight_layout(); c.draw_idle()
         f.tight_layout(); c.draw_idle()
 
     def live_dataframe(self):
+        """Return retained converted live samples in the standard CSV schema."""
         if not self.live_t: return pd.DataFrame(columns=['time_s','X_g','Y_g','Z_g'])
         return pd.DataFrame({'time_s':self.live_t,'X_g':self.live_x,'Y_g':self.live_y,'Z_g':self.live_z})
 
@@ -3121,6 +4015,8 @@ PSD averages: 4
         if not self.live_t:
             messagebox.showinfo('Live capture','No live samples have been captured yet.'); return
         df=self.live_dataframe(); cols=Cols('time_s','X_g','Y_g','Z_g')
+        self.reader=Processor('Reader')
+        self.pair=PairAnalysis(self.base,self.reader)
         self.reader.set(df,cols,float(self.fs.get()),'Live STM capture',metadata={'source_format':'converted_g','estimated_fs_hz':float(self.fs.get())})
         self.reader_label.configure(text=f'Reader: Live STM capture ({len(df)} samples)')
         self.status.set('Live capture loaded as Reader dataset.')
@@ -3153,24 +4049,35 @@ PSD averages: 4
             proc=self.baselines.get(axis)
             if proc is not None and proc.loaded:
                 kind='PSD' if isinstance(proc,BaselineSpectrum) else 'time'
-                parts.append(f"{axis}: {Path(proc.source).name} [{kind}]")
+                parts.append(f"{axis}: {Path(proc.source).name} [{kind}] Source: {proc.metadata.get('selected_source','time-domain')}"
+                             + (f"\nOrientation: {proc.metadata.get('orientation') or axis} -> {' / '.join(proc.metadata.get('axis_mapping',[axis]))}"
+                                f"\nAvailable reference curves: {', '.join(k for k in getattr(proc,'traces',{}) if k=='Ref') or 'none'}"
+                                f"\nFrequency range: {proc.freq_hz[0]:.3g} to {proc.freq_hz[-1]:.3g} Hz" if isinstance(proc,BaselineSpectrum) else ''))
             else:
                 parts.append(f"{axis}: not loaded")
-        return 'Baselines — ' + ' | '.join(parts)
+        reader_parts=[]
+        for axis in 'XYZ':
+            run=self.reader_runs.get(axis)
+            if run is not None and run.loaded:
+                reader_parts.append(f'{axis}-excited: {Path(run.source).name if run.source else run.label}')
+        reader_text=', '.join(reader_parts) if reader_parts else 'Not loaded'
+        return 'Baselines — ' + '\n'.join(parts) + f'\nReader runs: {reader_text}' + ('\nTranslation: Unavailable until reader data is loaded' if not reader_parts else '')
 
     def _copy_processor(self,source,label=None):
+        """Clone processor state so an analysis cannot mutate displayed data."""
         p=Processor(label or source.label)
         p.set(source.original_df.copy(), source.cols, source.fs, source.source,
               metadata=dict(source.metadata), source_df=source.source_df.copy() if source.source_df is not None else None)
         return p
 
     def _mapped_baseline_processor(self,target_axis,source_axis=None):
+        """Resolve a target axis to an independent time-domain baseline copy."""
         source_axis=(source_axis or self.baseline_use_axis[target_axis].get()).upper()
         src=self.baselines.get(source_axis)
         if src is None or not src.loaded:
             raise ValueError(f'No {source_axis}-axis baseline CSV is loaded for the {target_axis}-axis correction.')
         if isinstance(src,BaselineSpectrum):
-            raise ValueError('This baseline is a frequency-domain PSD. It can be used for Export derived correction, but not for paired time-domain comparison plots.')
+            raise ValueError('PSD-only baseline: Gordon-band comparison, K derivation, translation and correction export are available. Time-domain overlay, synchronous phase, H1 and coherence require time-domain captures.')
         out=self._copy_processor(src,label=f'Baseline {target_axis} (using {source_axis})')
         # If another driven-axis baseline is used as a surrogate, use that
         # baseline's driven-axis acceleration as the reference profile for the
@@ -3187,6 +4094,7 @@ PSD averages: 4
         return out
 
     def _activate_baseline_for_driven_axis(self):
+        """Update the legacy active baseline from the current explicit mapping."""
         target=self.driven_axis.get().upper()
         source=self.baseline_use_axis[target].get().upper()
         mapped=self._mapped_baseline_processor(target,source)
@@ -3201,44 +4109,52 @@ PSD averages: 4
             self.refresh()
         except Exception as exc:
             self.status.set(str(exc))
+            self.refresh()
 
     def _on_baseline_mapping_changed(self,target_axis):
         if self.driven_axis.get().upper()==target_axis:
             self._on_driven_axis_changed()
 
     def load_baseline_csvs(self):
+        """Load time-domain or PSD baselines and assign their excitation axes."""
         paths=filedialog.askopenfilenames(
-            title='Select baseline/reference CSVs (up to one per X, Y and Z)',
-            filetypes=[('CSV','*.csv'),('All files','*.*')])
+            title='Select baseline/reference CSV or Excel files',
+            filetypes=[('Baseline CSV/Excel','*.csv *.xlsx'),('All files','*.*')])
         if not paths:
             return
         loaded=[]; warnings_all=[]
         try:
             for path in paths:
+                proc,warnings=read_baseline_file(path,float(self.fs.get()))
+                orientation=baseline_orientation(path)
                 axis=infer_excitation_axis_from_filename(path)
-                if axis is None:
-                    response=simpledialog.askstring(
-                        'Baseline axis',
-                        f'Could not unambiguously identify X, Y or Z from:\n{Path(path).name}\n\nEnter the excitation axis (X, Y or Z):',
-                        parent=self.root)
-                    if response is None:
-                        continue
-                    axis=response.strip().upper()
-                    if axis not in 'XYZ' or len(axis)!=1:
-                        raise ValueError(f'Invalid baseline axis entered for {Path(path).name}: {response!r}')
-                source_df=pd.read_csv(path)
-                fmt=detect_accelerometer_csv_format(source_df)
-                if fmt=='baseline_psd':
-                    proc,warnings=load_baseline_spectrum_dataframe(source_df,path)
-                    proc.label=f'Baseline {axis} PSD'
-                    proc.metadata['excitation_axis']=axis
+                if orientation is None and (axis is None or proc.metadata.get('selected_source')=='Ctl'):
+                    response=simpledialog.askstring('Baseline orientation',
+                        f'{Path(path).name}\nEnter Lateral (X/Y) or Vertical (Z)' +
+                        (' (or X, Y, Z for a legacy CSV):' if proc.metadata.get('selected_source')!='Ctl' else ':'),parent=self.root)
+                    if response is None: continue
+                    choice=response.strip().upper()
+                    if choice in ('LATERAL','LATERAL (X/Y)','X/Y'): orientation='Lateral'
+                    elif choice in ('VERTICAL','VERTICAL (Z)'): orientation='Vertical'
+                    elif choice in ('X','Y','Z') and proc.metadata.get('selected_source')!='Ctl': axis=choice
+                    else: raise ValueError('Choose Lateral or Vertical for the test-house orientation.')
+                if orientation=='Lateral':
+                    # A filename containing an unambiguous X or Y token wins;
+                    # otherwise use the operator's persistent lateral assignment.
+                    if axis in ('X','Y'):
+                        axes=axis
+                    else:
+                        choice=self.lateral_assignment.get()
+                        axes={'X only':'X','Y only':'Y'}.get(choice,'XY')
                 else:
-                    df,cols,fs,meta,warnings=normalize_accelerometer_dataframe(source_df,float(self.fs.get()))
-                    proc=Processor(f'Baseline {axis}')
-                    meta=dict(meta); meta['excitation_axis']=axis
-                    proc.set(df,cols,fs,path,metadata=meta,source_df=source_df)
-                self.baselines[axis]=proc
-                loaded.append(f'{axis}={Path(path).name}')
+                    axes='Z' if orientation=='Vertical' else axis
+                if not axes:
+                    raise ValueError(f'Could not determine axis assignment for {Path(path).name}.')
+                proc.metadata.update({'orientation':orientation,'axis_mapping':list(axes),
+                                      'shared_lateral_source':axes=='XY','excitation_axis':axes[0]})
+                for axis in axes:
+                    self.baselines[axis]=proc
+                loaded.append(f'{"/".join(axes)}={Path(path).name}')
                 warnings_all.extend([f'{Path(path).name}: {w}' for w in warnings])
             if not loaded:
                 return
@@ -3256,20 +4172,15 @@ PSD averages: 4
                     self._activate_baseline_for_driven_axis()
                 except Exception as exc:
                     warnings_all.append(str(exc))
-            elif mapped_obj is None:
-                available=[a for a in 'XYZ' if self.baselines.get(a) is not None and self.baselines[a].loaded]
-                if available:
-                    self.baseline_use_axis[target].set(available[0])
-                    warnings_all.append(
-                        f'{target}-axis baseline is missing; {available[0]} is currently selected as a surrogate. Review Correction baseline mapping before export.')
-            else:
-                self.status.set('Frequency-domain baseline loaded. Use Export derived correction; paired time-domain comparison plots require a time-domain baseline.')
             msg='Loaded baselines: '+', '.join(loaded)
             self.status.set(msg)
             if warnings_all:
                 messagebox.showwarning('Baseline CSVs loaded with warnings','\n'.join(warnings_all))
-            if self.reader.loaded and self.base.loaded:
-                self.refresh()
+            self._sync_applied_mode_tabs()
+            self.refresh()
+            if any(isinstance(b,BaselineSpectrum) for b in self.baselines.values()):
+                for tab_id in self.tabs.tabs():
+                    if self.tabs.tab(tab_id,'text')=='PSD comparison': self.tabs.select(tab_id)
         except Exception as exc:
             messagebox.showerror('Load baseline error',str(exc))
 
@@ -3345,6 +4256,7 @@ PSD averages: 4
         return t,delta,mag
 
     def _group_shock_events(self,t,mag,threshold,release_s):
+        """Group threshold crossings, requiring a quiet release interval."""
         """Group threshold ringing into one physical event.
 
         Once S crosses threshold an event stays open until S has remained below
@@ -3383,23 +4295,43 @@ PSD averages: 4
     def load_csv(self,which):
         if which=='base':
             self.load_baseline_csvs(); return
-        path=filedialog.askopenfilename(filetypes=[('CSV','*.csv'),('All files','*.*')]);
+        path=filedialog.askopenfilename(title='Load reader CSV or Excel',
+            filetypes=[('Reader CSV/Excel','*.csv *.xlsx'),('All files','*.*')])
         if not path:return
         try:
-            source_df=pd.read_csv(path)
-            df,cols,fs,meta,warnings=normalize_accelerometer_dataframe(source_df,float(self.fs.get()))
-            self.reader.set(df,cols,fs,path,metadata=meta,source_df=source_df)
-            fmt='Raw VMM counts converted to g' if meta.get('source_format')=='raw_vmm_counts' else 'Converted g'
-            self.reader_label.configure(text=f'Reader: {Path(path).name} — {fmt} — {len(df):,} samples — {fs:.3f} Hz')
-            if warnings:
-                self.status.set(f'Loaded {Path(path).name}: '+'; '.join(warnings))
-                messagebox.showwarning('CSV loaded with warnings','\n'.join(warnings))
+            proc,warnings=read_reader_file(path,float(self.fs.get()))
+            if isinstance(proc,BaselineSpectrum):
+                orientation=baseline_orientation(path)
+                axis='Z' if orientation=='Vertical' else infer_excitation_axis_from_filename(path)
+                if axis is None:
+                    choices='X or Y' if orientation=='Lateral' else 'X, Y or Z'
+                    response=simpledialog.askstring('Reader PSD axis',
+                        f'{Path(path).name}\nWhich reader axis does this measured PSD represent? Enter {choices}:',parent=self.root)
+                    if response is None: return
+                    axis=response.strip().upper()
+                    if axis not in (('X','Y') if orientation=='Lateral' else ('X','Y','Z')):
+                        raise ValueError(f'Choose {choices} for the reader PSD axis.')
+                proc.metadata.update({'excitation_axis':axis,'orientation':orientation})
+                self.driven_axis.set(axis)
+                description=f"PSD {axis}; source: {proc.metadata['selected_source']}; {proc.freq_hz[0]:.3g}?{proc.freq_hz[-1]:.3g} Hz"
             else:
-                self.status.set(f'Loaded {Path(path).name}: {fmt}, {len(df):,} samples at {fs:.3f} Hz.')
+                axis=infer_excitation_axis_from_filename(path) or self.driven_axis.get().upper()
+                if axis not in 'XYZ': axis='X'
+                proc.metadata['excitation_axis']=axis
+                self.driven_axis.set(axis)
+                description=f'{len(proc.df):,} samples; {proc.fs:.3f} Hz'
+            self.reader_runs[axis]=proc
+            self.reader=proc
+            self.pair=PairAnalysis(self.base,self.reader)
+            loaded=', '.join(a for a in 'XYZ' if self.reader_runs.get(a) is not None and self.reader_runs[a].loaded)
+            self.reader_label.configure(text=f'Reader {axis}-excited: {Path(path).name} — {description}\nLoaded excitation slots: {loaded or "none"}')
+            if warnings:
+                messagebox.showwarning('Reader loaded with warnings','\n'.join(warnings))
             try:
                 self._activate_baseline_for_driven_axis()
-            except Exception:
+            except ValueError:
                 pass
+            self._sync_applied_mode_tabs()
             self.refresh()
         except Exception as e:messagebox.showerror('Load error',str(e))
     def load_demo_pair(self):
@@ -3421,6 +4353,7 @@ PSD averages: 4
                 self.baseline_use_axis[axis].set(axis)
             rsrc=pd.read_csv(reader)
             rdf,rcols,rfs,rmeta,_=normalize_accelerometer_dataframe(rsrc,float(self.fs.get()))
+            self.reader=Processor('Reader')
             self.reader.set(rdf,rcols,rfs,str(reader),metadata=rmeta,source_df=rsrc)
             self.reader_label.configure(text=f'Reader: {reader.name} ({len(rdf)} samples)')
             self._activate_baseline_for_driven_axis()
@@ -3434,6 +4367,8 @@ PSD averages: 4
         copies to the common paired interval and a whole number of complete
         PSD-analysis spans. Original imported DataFrames are never changed.
         """
+        if isinstance(self.reader,BaselineSpectrum):
+            raise ValueError('PSD-only reader cannot be cropped in time.')
         if not (self.base.loaded and self.reader.loaded):
             return None
 
@@ -3505,6 +4440,8 @@ PSD averages: 4
         This avoids a global driven-axis state: each offline analysis view resolves the
         target axis through the explicit baseline mapping at the point of use.
         """
+        if isinstance(self.reader,BaselineSpectrum):
+            raise ValueError('PSD-only reader: time-domain pairing, phase, H1 and coherence are unavailable.')
         target_axis=target_axis.upper()
         source_axis=self.baseline_use_axis[target_axis].get().upper()
         base=self._mapped_baseline_processor(target_axis,source_axis)
@@ -3535,9 +4472,32 @@ PSD averages: 4
 
     def params(self): return int(self.n.get()),float(self.ov.get())/100,int(self.segs.get()),int(self.start.get())
     def clear(self,name): f,c=self.fig[name]; f.clear(); return f,c
+    def _show_issue2_inactive(self,name):
+        """Keep Issue 2-only tabs from presenting calculations in Issue 1 mode."""
+        if not self._issue1_active():
+            return False
+        f,c=self.clear(name); ax=f.add_subplot(111); ax.axis('off')
+        ax.text(.5,.5,'Issue 2 view inactive while Issue 1 FFT ensemble is active.',
+                ha='center',va='center',fontsize=12)
+        c.draw_idle()
+        return True
     def refresh(self):
+        """Recompute every analysis view that has sufficient loaded inputs."""
         try:
             if not self.reader.loaded:
+                self.plot_psd()
+                self.base_label.configure(text=self._baseline_summary_text())
+                return
+            if isinstance(self.reader,BaselineSpectrum):
+                self.plot_psd()
+                for name in ('Raw comparison','Selected stage','Issue 1 FFT ensemble','Transfer function'):
+                    if name not in self.fig: continue
+                    f,c=self.clear(name); ax=f.add_subplot(111); ax.axis('off')
+                    ax.text(.5,.5,'PSD-only reader: time-domain samples are unavailable.\nUse PSD comparison and Issue 2 Gordon bands / translation.',ha='center',va='center')
+                    c.draw_idle()
+                self.plot_bands(); self.plot_translation()
+                self.base_label.configure(text=self._baseline_summary_text())
+                self.status.set('Reader Ctl PSD loaded. Time-domain, Issue 1 FFT, H1 and coherence are unavailable.')
                 return
             self.reader.fs=float(self.fs.get())
             errors=[]
@@ -3545,13 +4505,37 @@ PSD averages: 4
                 self.plot_shock_analysis()
             except Exception as exc:
                 errors.append(f'Shock analysis: {exc}')
+            try:
+                self.plot_issue1_analysis()
+            except Exception as exc:
+                errors.append(f'Issue 1 analysis: {exc}')
+            if self._issue1_active():
+                for label,func in [
+                    ('Calculation stages',self.plot_stage),
+                    ('Gordon comparison',self.plot_bands)]:
+                    try:
+                        func()
+                    except Exception as exc:
+                        errors.append(f'{label}: {exc}')
 
             have_baseline=any(b is not None and b.loaded for b in self.baselines.values())
             if have_baseline:
-                for label,func in [
-                    ('Raw comparison',self.plot_raw),('Selected stage',self.plot_stage),
-                    ('PSD comparison',self.plot_psd),('Gordon bands',self.plot_bands),
-                    ('Transfer function',self.plot_transfer),('Translation function',self.plot_translation)]:
+                functions=[('Raw comparison',self.plot_raw)]
+                if self._issue1_active():
+                    for name in ('Transfer function',):
+                        f,c=self.clear(name); ax=f.add_subplot(111); ax.axis('off')
+                        ax.text(.5,.5,'Issue 2 view inactive while Issue 1 FFT ensemble is active.',
+                                ha='center',va='center',fontsize=12)
+                        c.draw_idle()
+                    functions.append(('PSD comparison',self.plot_psd))
+                    functions.append(('Translation function',self.plot_translation))
+                else:
+                    functions.extend([
+                        ('Selected stage',self.plot_stage),
+                        ('PSD comparison',self.plot_psd),('Gordon bands',self.plot_bands),
+                        ('Transfer function',self.plot_transfer),
+                        ('Translation function',self.plot_translation)])
+                for label,func in functions:
                     try:
                         func()
                     except Exception as exc:
@@ -3559,12 +4543,47 @@ PSD averages: 4
                 self.base_label.configure(text=self._baseline_summary_text())
             if errors:
                 self.status.set('Processing completed with unavailable views: '+'; '.join(errors))
+            elif self._issue1_active():
+                self.status.set('Issue 1 legacy FFT-amplitude ensemble complete; Issue 2 PSD and transfer views are inactive.')
             elif have_baseline:
                 self.status.set('Multi-axis processing complete — X/Y/Z views use the explicit correction baseline mapping.')
             else:
                 self.status.set('Reader loaded — Shock analysis available. Load baseline CSV(s) for paired vibration views.')
         except Exception as e:
             self.status.set(str(e)); messagebox.showerror('Processing error',str(e))
+
+    def _offline_issue1_result(self):
+        """Calculate Issue 1 once from the loaded Reader and selected start."""
+        if isinstance(self.reader,BaselineSpectrum):
+            raise ValueError('Issue 1 FFT requires reader time samples; the loaded workbook contains only PSD.')
+        if not self.reader.loaded:
+            raise ValueError('Load a Reader CSV for offline Issue 1 analysis.')
+        _,x,y,z=self.reader.xyz()
+        xyz=np.column_stack((x,y,z))
+        return issue1_ensemble_fft(
+            xyz,float(self.fs.get()),start=int(self.start.get()))
+
+    def plot_issue1_analysis(self):
+        """Render the dedicated offline Issue 1 result for the Reader dataset."""
+        f,c=self.clear('Issue 1 FFT ensemble')
+        if not self._issue1_active():
+            ax=f.add_subplot(111); ax.axis('off')
+            ax.text(
+                .5,.5,
+                'Issue 1 is not active.\nSelect it in Accelerometer / processing '
+                'configuration and press Apply processing settings.',
+                ha='center',va='center',fontsize=12)
+            c.draw_idle(); return
+        if not self.reader.loaded:
+            ax=f.add_subplot(111); ax.axis('off')
+            ax.text(.5,.5,'Load a Reader CSV for offline Issue 1 analysis.',
+                    ha='center',va='center')
+            c.draw_idle(); return
+        result=self._offline_issue1_result()
+        source=Path(self.reader.source).name if self.reader.source else self.reader.label
+        self._draw_issue1_result(
+            f,c,result,f'Offline Issue 1 legacy FFT-amplitude ensemble — {source}',
+            float(self.fs.get()))
 
     def plot_raw(self):
         f,c=self.clear('Raw comparison'); axs=f.subplots(3,1,sharex=True)
@@ -3671,6 +4690,60 @@ PSD averages: 4
         f.suptitle('Measured-data shock analysis\n'+summary,fontsize=11)
         f.tight_layout(rect=(0,0,1,.94)); c.draw_idle()
 
+    def _shock_summary_rows(self):
+        try:
+            w=int(self.offline_shock_window.get()); threshold=float(self.offline_shock_threshold_g.get()); release_s=float(self.offline_shock_release_s.get())
+        except Exception:
+            w=50; threshold=1.0; release_s=0.25
+        rows=[]
+        for applied in 'XYZ':
+            b=self.shock_baselines.get(applied); r=self.shock_readers.get(applied)
+            row={'applied_axis':applied,'baseline_file':'','reader_file':'','baseline_peak_s_g':np.nan,'reader_peak_s_g':np.nan,'Kshock_base_over_reader':np.nan,'reader_event_count':0,'dominant_reader_axis':'','threshold_g':threshold,'event_release_s':release_s,'steady_state_window_samples':w}
+            if b is not None and b.loaded:
+                row['baseline_file']=Path(b.source).name if getattr(b,'source',None) else b.label
+                try:
+                    _,db,mb=self._shock_series_for_processor(b,w); row['baseline_peak_s_g']=float(np.max(mb))
+                except Exception: pass
+            if r is not None and r.loaded:
+                row['reader_file']=Path(r.source).name if getattr(r,'source',None) else r.label
+                try:
+                    tr,dr,mr=self._shock_series_for_processor(r,w); ri=int(np.argmax(mr))
+                    row['reader_peak_s_g']=float(mr[ri]); row['dominant_reader_axis']='XYZ'[int(np.argmax(np.abs(dr[ri])))]
+                    events=self._group_shock_events(tr,mr,threshold,release_s); row['reader_event_count']=len(events)
+                    if events:
+                        durations=[float(tr[e]-tr[s]) for s,e,_ in events]
+                        row['max_event_duration_s']=max(durations)
+                    else: row['max_event_duration_s']=0.0
+                    row['reader_peak_dX_g']=float(dr[ri,0]); row['reader_peak_dY_g']=float(dr[ri,1]); row['reader_peak_dZ_g']=float(dr[ri,2])
+                except Exception: pass
+            if np.isfinite(row['baseline_peak_s_g']) and np.isfinite(row['reader_peak_s_g']) and row['reader_peak_s_g']>1e-12:
+                row['Kshock_base_over_reader']=row['baseline_peak_s_g']/row['reader_peak_s_g']
+            rows.append(row)
+        return rows
+
+    def refresh_shock_summary(self):
+        tree=getattr(self,'shock_summary_tree',None)
+        if tree is None: return
+        for item in tree.get_children(): tree.delete(item)
+        for row in self._shock_summary_rows():
+            vals=(row['applied_axis'],row['baseline_file'] or 'Not loaded',row['reader_file'] or 'Not loaded',
+                  f"{row['baseline_peak_s_g']:.3f}" if np.isfinite(row['baseline_peak_s_g']) else '—',
+                  f"{row['reader_peak_s_g']:.3f}" if np.isfinite(row['reader_peak_s_g']) else '—',
+                  f"{row['Kshock_base_over_reader']:.3f}" if np.isfinite(row['Kshock_base_over_reader']) else '—',
+                  str(row['reader_event_count']) if row['reader_file'] else '—',row['dominant_reader_axis'] or '—')
+            tree.insert('',tk.END,values=vals)
+
+    def export_shock_results(self):
+        rows=self._shock_summary_rows()
+        if not any(r['reader_file'] for r in rows):
+            messagebox.showinfo('Export shock results','Load at least one dedicated shock Reader CSV first.'); return
+        path=filedialog.asksaveasfilename(defaultextension='.csv',filetypes=[('CSV','*.csv')],initialfile='1174_shock_characterisation_summary.csv')
+        if not path: return
+        pd.DataFrame(rows).to_csv(path,index=False)
+        sidecar=Path(path).with_name(Path(path).stem+'_settings.json')
+        sidecar.write_text(json.dumps({'log_type':'1174 shock characterisation summary','generated_local':time.strftime('%Y-%m-%d %H:%M:%S'),'application_title':APP_TITLE,'shock_processing':{'steady_state_window_samples':int(self.offline_shock_window.get()),'threshold_g':float(self.offline_shock_threshold_g.get()),'event_release_s':float(self.offline_shock_release_s.get()),'method':'raw XYZ deviation from local steady-state vector; dedicated shock path'},'rows':rows},indent=2,ensure_ascii=False,default=str),encoding='utf-8')
+        self.status.set(f'Exported shock summary to {Path(path).name} with {sidecar.name}.')
+
     def plot_shock_translation(self):
         """Peak-response comparison for dedicated baseline/reader shock captures.
 
@@ -3746,6 +4819,14 @@ PSD averages: 4
         f.tight_layout(rect=(0,0,1,.94)); c.draw_idle()
 
     def plot_stage(self):
+        if self._issue1_active() and not isinstance(self.reader,BaselineSpectrum):
+            result=self._offline_issue1_result()
+            f,c=self.clear('Selected stage')
+            self._draw_issue1_result(
+                f,c,result,'Issue 1 calculation stages',float(self.fs.get()),
+                selected_axis=self.stage_axis.get())
+            return
+        if self._show_issue2_inactive('Selected stage'): return
         a=self.stage_axis.get()
         n,ov,segs,start=self.params()
         base,reader,_,source=self._paired_axis_context(a)
@@ -3788,7 +4869,60 @@ PSD averages: 4
         f.tight_layout()
         c.draw_idle()
 
+    def _plot_reference_psd(self):
+        spectra=list({id(obj):obj for obj in self.baselines.values()
+                      if isinstance(obj,BaselineSpectrum) and obj.loaded}.values())
+        plot_axes={}
+        if isinstance(self.reader,BaselineSpectrum):
+            target=self.reader.metadata['excitation_axis']
+            source=self.baseline_use_axis[target].get()
+            baseline=self.baselines.get(source)
+            if isinstance(baseline,Processor) and baseline.loaded:
+                spectrum=self._baseline_axis_spectrum(target,source)
+                spectra.append(spectrum); plot_axes[id(spectrum)]=[target]
+            elif not isinstance(baseline,BaselineSpectrum):
+                spectra.append(None)
+        if not spectra: return False
+        f,c=self.clear('PSD comparison')
+        labels={'Ctl':'Ctl = measured control accelerometer PSD',
+                'Ref':'Ref = commanded/nominal target PSD'}
+        for i,spec in enumerate(spectra):
+            ax=f.add_subplot(len(spectra),1,i+1)
+            traces={} if spec is None else getattr(spec,'traces',{'PSD':(spec.freq_hz,spec.psd_g2_per_hz)})
+            for name,(freq,psd) in traces.items():
+                if name not in ('Ctl','Ref','PSD'): continue
+                ax.semilogy(freq,np.where(psd>0,psd,np.nan),
+                            label=labels.get(name,name),linewidth=1.8,
+                            linestyle='--' if name=='Ref' else '-')
+            axes=plot_axes.get(id(spec),[a for a in 'XYZ' if self.baselines.get(self.baseline_use_axis[a].get()) is spec])
+            if isinstance(self.reader,BaselineSpectrum):
+                reader=self.reader; reader_axis=reader.metadata['excitation_axis']
+                if spec is None or reader_axis in axes:
+                    for name,(freq,psd) in getattr(reader,'traces',{'PSD':(reader.freq_hz,reader.psd_g2_per_hz)}).items():
+                        if name not in ('Ctl','Ref','PSD'): continue
+                        ax.semilogy(freq,np.where(psd>0,psd,np.nan),label=f'Reader {reader_axis} {name}',linestyle='--' if name=='Ref' else '-')
+            elif self.reader.loaded:
+                n,ov,segs,start=self.params()
+                for a in axes:
+                    try:
+                        freq,_,psd,_=self.reader.welch(a,start,n,ov,segs)
+                        ax.semilogy(freq[1:],np.maximum(psd[1:],1e-18),label=f'Reader {a}',linewidth=1)
+                    except ValueError as exc:
+                        ax.text(.01,.01,f'Reader {a}: {exc}',transform=ax.transAxes,fontsize=8)
+            reader_only=spec is None
+            if reader_only: spec=self.reader
+            orientation=spec.metadata.get('orientation')
+            suffix='Lateral (X/Y)' if orientation=='Lateral' else 'Vertical (Z)' if orientation=='Vertical' else '/'.join(axes)
+            ax.set(title=f'Baseline/reference PSD – {suffix}\n{Path(spec.source).name}',
+                   xlabel='Frequency (Hz)',ylabel='PSD (g²/Hz)',
+                   xlim=(spec.freq_hz[0],spec.freq_hz[-1]))
+            ax.grid(True,which='both'); ax.legend(fontsize=8,ncol=2)
+        f.tight_layout(); c.draw_idle()
+        return True
+
     def plot_psd(self):
+        if self._plot_reference_psd(): return
+        if self._show_issue2_inactive('PSD comparison'): return
         n,ov,segs,start=self.params(); f,c=self.clear('PSD comparison'); ax=f.add_subplot(111)
         colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}
         plotted=False
@@ -3806,17 +4940,25 @@ PSD averages: 4
         f.tight_layout(); c.draw_idle()
 
     def plot_bands(self):
+        if self._issue1_active() and not isinstance(self.reader,BaselineSpectrum):
+            result=self._offline_issue1_result()
+            f,c=self.clear('Gordon bands')
+            self._draw_issue1_gordon_comparison(
+                f,c,result,'Issue 1 Fourier-amplitude comparison with Gordon Office')
+            return
+        if not isinstance(self.reader,BaselineSpectrum) and self._show_issue2_inactive('Gordon bands'): return
         if not self.reader.loaded:return
         n,ov,segs,start=self.params(); f,c=self.clear('Gordon bands'); ax=f.add_subplot(111); mode=self.units.get(); limv=gordon_office_velocity_um_s(GORDON_FC)
         colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}; plotted=False
+        worst_ratio=-np.inf; worst_axis=''; worst_index=0; worst_measured=np.nan
         if mode=='RMS acceleration (g)': lim=(limv*1e-6)*(2*np.pi*GORDON_FC)/G0; yl='RMS g'
         elif mode=='RMS displacement (µm)': lim=limv/(2*np.pi*GORDON_FC); yl='RMS µm'
         else: lim=limv; yl='RMS µm/s'
         for a in 'XYZ':
             source=self.baseline_use_axis[a].get().upper(); src=self.baselines.get(source)
             try:
-                if isinstance(src,BaselineSpectrum):
-                    bb=src.bands(); rb,_=self._reader_axis_band_statistics(a)
+                if isinstance(src,BaselineSpectrum) or isinstance(self.reader,BaselineSpectrum):
+                    bb=self._baseline_axis_spectrum(a,source).bands(); rb,_=self._reader_axis_band_statistics(a)
                     if mode=='RMS acceleration (g)': b=bb.a_rms_g; r=rb.a_rms_g
                     elif mode=='RMS displacement (µm)': b=bb.x_rms_um; r=rb.x_rms_um
                     else: b=bb.v_rms_um_s; r=rb.v_rms_um_s
@@ -3827,17 +4969,37 @@ PSD averages: 4
                     else: b=q.v_rms_um_s; r=q.reader_v_rms_um_s
                 ax.semilogx(GORDON_FC,b,marker='o',linestyle='--',color=colours[a],alpha=.75,label=f'Baseline {a} ({source})')
                 ax.semilogx(GORDON_FC,r,marker='o',linestyle='-',color=colours[a],label=f'Reader {a}')
+                reader_values=np.asarray(r,float)
+                ratios=np.divide(reader_values,lim,out=np.zeros_like(reader_values),where=lim>0)
+                index=int(np.argmax(ratios))
+                if ratios[index]>worst_ratio:
+                    worst_ratio=float(ratios[index]); worst_axis=a
+                    worst_index=index; worst_measured=float(reader_values[index])
                 plotted=True
             except Exception:
                 continue
         ax.semilogx(GORDON_FC,lim,marker='s',color='0.25',linewidth=1.5,label='Gordon Office')
-        set_gordon_xaxis(ax,rotate=45); ax.set_xlabel('1/3-octave band centre (Hz)'); ax.set_ylabel(yl); ax.set_title(f'X / Y / Z Gordon-band comparison — {mode}'); ax.grid(True,which='both')
+        set_gordon_xaxis(ax,rotate=45); ax.set_xlabel('1/3-octave band centre (Hz)'); ax.set_ylabel(yl)
+        title=f'Issue 2 X / Y / Z Gordon-band RMS comparison — {mode}'
+        if plotted:
+            state='EXCEEDED' if worst_ratio>1.0 else 'PASS'
+            title+=(f'\n{state}: worst reader {worst_axis} at {GORDON_FC[worst_index]:g} Hz; '
+                   f'{worst_measured:.6g} / {float(lim[worst_index]):.6g} {yl} = '
+                   f'{worst_ratio:.3f}×')
+        ax.set_title(title); ax.grid(True,which='both')
         if plotted: ax.legend(ncol=2,fontsize=8)
         f.tight_layout(); c.draw_idle()
 
     def plot_transfer(self):
+        if self._show_issue2_inactive('Transfer function'): return
         n,ov,segs,start=self.params()
         a=self.transfer_axis.get()
+        source=self.baseline_use_axis[a].get()
+        if isinstance(self.baselines.get(source),BaselineSpectrum) or isinstance(self.reader,BaselineSpectrum):
+            f,c=self.clear('Transfer function'); ax=f.add_subplot(111); ax.axis('off')
+            ax.text(.5,.5,'PSD-only data: H1, synchronous phase and coherence are unavailable.\nUse Gordon bands or Translation function for Ctl-based correction.',
+                    ha='center',va='center',wrap=True)
+            c.draw_idle(); return
         base,reader,pair,source=self._paired_axis_context(a)
         d=pair.paired_band_window(start,n,ov,segs)
         q=d[d.axis==a]
@@ -3876,7 +5038,54 @@ PSD averages: 4
         f.tight_layout()
         c.draw_idle()
 
+    def _plot_issue1_translation(self):
+        """Show driven-axis-only Issue 1 translations for every loaded reader slot."""
+        f,c=self.clear('Translation function'); axs=f.subplots(2,2)
+        colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}; notes=[]; yl='Peak g per FFT bin'
+        for axis in 'XYZ':
+            reader=self.reader_runs.get(axis)
+            if reader is None:
+                # Backward-compatible single active reader, but only when its
+                # excitation metadata agrees with the requested axis.
+                candidate=self.reader
+                if getattr(candidate,'loaded',False) and str(candidate.metadata.get('excitation_axis',axis)).upper()==axis:
+                    reader=candidate
+            if reader is None or not reader.loaded or isinstance(reader,BaselineSpectrum):
+                notes.append(f'{axis}: no {axis}-excited time-domain reader run'); continue
+            try:
+                result=self.derive_translation(axis,ISSUE1_METHOD)
+                rf,reader_amp,_=self._issue1_axis_amplitudes_from_processor(reader,axis)
+                idx=[int(np.argmin(np.abs(rf-fc))) for fc in result.coordinates_hz]
+                raw_peak=reader_amp[idx]
+                ref_peak=raw_peak*result.k_values
+                raw_values,yl,_=self._issue1_display_values(raw_peak,result.coordinates_hz)
+                ref_values,_,_=self._issue1_display_values(ref_peak,result.coordinates_hz)
+                translated_values=raw_values*result.k_values
+                axs[0,0].semilogx(result.coordinates_hz,result.k_values,marker='o',color=colours[axis],label=f'{axis} K')
+                axs[0,1].semilogx(result.coordinates_hz,ref_values,marker='o',color=colours[axis],label=f'Reference {axis}')
+                axs[1,0].semilogx(result.coordinates_hz,raw_values,marker='o',color=colours[axis],label=f'Raw {axis}-excited reader {axis}')
+                axs[1,1].semilogx(result.coordinates_hz,translated_values,marker='o',color=colours[axis],label=f'Translated {axis}')
+                notes.append(f'{axis}: {result.reference_domain} reference; median K {np.nanmedian(result.k_values):.3f}')
+            except Exception as exc:
+                notes.append(f'{axis}: unavailable ({exc})')
+        axs[0,0].axhline(1.0,color='0.5',linewidth=1)
+        axs[0,0].set_title('Issue 1 direct K = reference / driven-axis reader amplitude')
+        axs[0,1].set_title('Reference Issue 1 amplitude')
+        axs[1,0].set_title('Raw primary reader response')
+        axs[1,1].set_title('Translated environmental estimate')
+        for ax in axs.flat:
+            ax.set_xlim(ISSUE1_LOW_HZ,ISSUE1_HIGH_HZ); ax.set_xlabel('Issue 1 FFT frequency (Hz)'); ax.grid(True,which='both')
+            if ax.lines: ax.legend(fontsize=8)
+        axs[0,0].set_ylabel('K factor')
+        for ax in (axs[0,1],axs[1,0],axs[1,1]): ax.set_ylabel(yl)
+        f.suptitle('Issue 1 X / Y / Z driven-axis translation overview\n'+' | '.join(notes),fontsize=10)
+        f.tight_layout(); c.draw_idle()
+
     def plot_translation(self):
+        if self._issue1_active() and not isinstance(self.reader,BaselineSpectrum):
+            self._plot_issue1_translation()
+            return
+        if not isinstance(self.reader,BaselineSpectrum) and self._show_issue2_inactive('Translation function'): return
         f,c=self.clear('Translation function'); axs=f.subplots(2,2)
         colours={'X':'tab:blue','Y':'tab:orange','Z':'tab:green'}
         model_notes=[]; any_plot=False
@@ -3915,7 +5124,7 @@ PSD averages: 4
         f.tight_layout(); c.draw_idle()
 
     def plot_tilt(self):
-        avg=float(self.avg.get()); tb,xb,yb,zb,rb,pb,_=self.base.tilt(avg); tr,xr,yr,zr,rr,pr,_=self.reader.tilt(avg); m=min(len(tb),len(tr)); f,c=self.clear('Tilt comparison'); axs=f.subplots(2,2)
+        avg=max(1,int(self.tilt_average_samples.get()))/float(self.fs.get()); tb,xb,yb,zb,rb,pb,_=self.base.tilt(avg); tr,xr,yr,zr,rr,pr,_=self.reader.tilt(avg); m=min(len(tb),len(tr)); f,c=self.clear('Tilt comparison'); axs=f.subplots(2,2)
         # mean gravity vectors
         gb=np.array([np.mean(xb),np.mean(yb),np.mean(zb)]); gr=np.array([np.mean(xr),np.mean(yr),np.mean(zr)])
         axs[0,0].quiver([0,0],[0,0],[gb[0],gr[0]],[gb[2],gr[2]],angles='xy',scale_units='xy',scale=1); axs[0,0].set(title='Gravity vector: X-Z plane',xlabel='X (g)',ylabel='Z (g)'); axs[0,0].axis('equal')
@@ -3927,8 +5136,9 @@ PSD averages: 4
         n,ov,segs,start=self.params()
         a=self.driven_axis.get()
         scores,rec,common,band,series=self.pair.model_comparison(n,ov,segs,a)
-        _,xb,yb,zb,rb,pb,_=self.base.tilt(float(self.avg.get()))
-        _,xr,yr,zr,rr,pr,_=self.reader.tilt(float(self.avg.get()))
+        tilt_avg=max(1,int(self.tilt_average_samples.get()))/float(self.fs.get())
+        _,xb,yb,zb,rb,pb,_=self.base.tilt(tilt_avg)
+        _,xr,yr,zr,rr,pr,_=self.reader.tilt(tilt_avg)
         dr=float(np.mean(rr)-np.mean(rb))
         dp=float(np.mean(pr)-np.mean(pb))
 
@@ -3995,15 +5205,36 @@ PSD averages: 4
         self.baseline_use_axis[target_axis].set(chosen)
         return chosen
 
+    def _baseline_axis_spectrum(self,target_axis,source_axis):
+        src=self.baselines.get(source_axis)
+        if isinstance(src,BaselineSpectrum): return src
+        base=self._mapped_baseline_processor(target_axis,source_axis)
+        base.fs=float(self.fs.get())
+        n,ov,segs,start=self.params()
+        freq,_,psd,_=base.welch(target_axis,start,n,ov,segs)
+        spectrum=BaselineSpectrum('Baseline PSD')
+        spectrum.set(freq,psd,base.source,base.metadata)
+        return spectrum
+
     def _reader_axis_band_statistics(self,target_axis):
-        """Return median reader Gordon-band RMS values over all complete PSD analysis windows."""
+        """Return reader Gordon RMS from its PSD or complete time-domain windows."""
+        reader=self.reader_runs.get(target_axis) or self.reader
+        excitation=str(getattr(reader,'metadata',{}).get('excitation_axis',target_axis)).upper()
+        if excitation!=target_axis:
+            raise ValueError(f'no {target_axis} reader data: the active reader run is {excitation}-excited and is cross-axis diagnostic only.')
+        if isinstance(reader,BaselineSpectrum):
+            axis=reader.metadata.get('excitation_axis')
+            if target_axis!=axis:
+                raise ValueError(f'Reader PSD represents {axis} only; no {target_axis} reader data is loaded.')
+            bands=reader.bands()
+            return bands,bands.copy()
         n,ov,segs,start=self.params()
         # Use all complete analysis spans from the reader. This is deliberately
         # independent of the frequency-domain baseline because there is no
         # synchronous time history to pair against.
         hop=int(round(n*(1-ov)))
         span=n+(segs-1)*hop
-        total=len(self.reader.df)
+        total=len(reader.df)
         starts=list(range(0,total-span+1,span))
         if not starts:
             # Fall back to the selected start if the file only contains one span.
@@ -4012,13 +5243,14 @@ PSD averages: 4
             raise ValueError(f'Reader file does not contain the {span} samples required for one complete PSD analysis span.')
         frames=[]
         for s in starts:
-            f,_,p,_=self.reader.welch(target_axis,s,n,ov,segs)
-            b=self.reader.bands(f,p).copy(); b['start_sample']=s; frames.append(b)
+            f,_,p,_=reader.welch(target_axis,s,n,ov,segs)
+            b=reader.bands(f,p).copy(); b['start_sample']=s; frames.append(b)
         allb=pd.concat(frames,ignore_index=True)
         med=allb.groupby('fc_hz',as_index=False)[['a_rms_g','v_rms_um_s','x_rms_um']].median()
         return med,allb
 
     def _axis_correction_from_psd_baseline(self,target_axis,source_axis,spectrum):
+        """Derive band K values from an unpaired PSD reference and reader medians."""
         base_bands=spectrum.bands()
         reader_med,reader_windows=self._reader_axis_band_statistics(target_axis)
         q=base_bands.merge(reader_med,on='fc_hz',suffixes=('_base','_reader'))
@@ -4032,19 +5264,114 @@ PSD averages: 4
         return rec,common,band,q,reader_windows
 
     def _axis_correction_result(self,target_axis,source_axis):
+        """Select the PSD or paired-time-history correction workflow for one axis."""
+        reader=self.reader_runs.get(target_axis) or self.reader
+        excitation=str(getattr(reader,'metadata',{}).get('excitation_axis',target_axis)).upper()
+        if excitation!=target_axis:
+            raise ValueError(f'{target_axis} correction requires the {target_axis}-excited reader run, not {excitation}-excited cross-axis data.')
         src=self.baselines.get(source_axis)
-        if isinstance(src,BaselineSpectrum):
+        if isinstance(src,BaselineSpectrum) or isinstance(reader,BaselineSpectrum):
+            src=self._baseline_axis_spectrum(target_axis,source_axis)
             rec,common,band,series,reader_windows=self._axis_correction_from_psd_baseline(target_axis,source_axis,src)
             return None,rec,common,band,series,src
         local_base=self._mapped_baseline_processor(target_axis,source_axis)
         # Work on independent Processor copies so export cannot alter the
         # currently displayed/cropped datasets.
-        local_reader=self._copy_processor(self.reader,label='Reader')
+        local_reader=self._copy_processor(reader,label='Reader')
         local_base.fs=local_reader.fs=float(self.fs.get())
         pair=PairAnalysis(local_base,local_reader)
         n,ov,segs,start=self.params()
         scores,rec,common,band,series=pair.model_comparison(n,ov,segs,target_axis)
         return scores,rec,common,band,series,local_base
+
+    def _issue1_axis_amplitudes_from_processor(self,proc,axis):
+        """Median Issue-1 ensemble amplitude for one primary axis across complete spans."""
+        if isinstance(proc,BaselineSpectrum):
+            raise ValueError('Time-domain processor required.')
+        required=issue1_required_samples()
+        total=len(proc.df)
+        starts=list(range(0,total-required+1,required))
+        if not starts:
+            start=int(self.start.get())
+            starts=[start] if start>=0 and start+required<=total else []
+        if not starts:
+            raise ValueError(f'{proc.label}: Issue 1 needs at least {required} samples for one 19-FFT ensemble.')
+        xyz=np.column_stack([proc.axis(a) for a in 'XYZ'])
+        values=[]; frequency=None
+        for start in starts:
+            result=issue1_ensemble_fft(xyz,float(proc.fs),start=start)
+            frequency=result.frequency_hz
+            values.append(result.ensemble_amplitude_g['XYZ'.index(axis)])
+        return np.asarray(frequency,float),np.nanmedian(np.vstack(values),axis=0),starts
+
+    def _derive_issue1_translation(self,target_axis,source_axis):
+        reader=self.reader_runs.get(target_axis) or self.reader
+        if reader is None or not reader.loaded or isinstance(reader,BaselineSpectrum):
+            raise ValueError(f'Issue 1 requires a time-domain {target_axis}-excited reader capture.')
+        excitation=str(reader.metadata.get('excitation_axis',target_axis)).upper()
+        if excitation!=target_axis:
+            raise ValueError(f'{target_axis} translation requires a {target_axis}-excited reader run; {excitation}-excited data are cross-axis diagnostic only.')
+        rf,reader_amp,reader_starts=self._issue1_axis_amplitudes_from_processor(reader,target_axis)
+        reference=self.baselines.get(source_axis)
+        if reference is None or not reference.loaded:
+            raise ValueError(f'No {source_axis} reference is loaded for {target_axis}.')
+        if isinstance(reference,BaselineSpectrum):
+            bf,base_amp=issue1_amplitude_from_psd(
+                reference.freq_hz,reference.psd_g2_per_hz,float(reader.fs),ISSUE1_FFT_N,True)
+            if not np.allclose(bf,rf):
+                base_amp=np.interp(rf,bf,base_amp,left=np.nan,right=np.nan)
+            reference_domain='PSD'
+        else:
+            mapped=self._mapped_baseline_processor(target_axis,source_axis)
+            mapped.fs=float(reader.fs)
+            _,base_amp,_=self._issue1_axis_amplitudes_from_processor(mapped,target_axis)
+            reference_domain='time'
+        active=(rf>=ISSUE1_LOW_HZ)&(rf<=ISSUE1_HIGH_HZ)&np.isfinite(base_amp)&np.isfinite(reader_amp)&(reader_amp>1e-12)
+        coords=rf[active]
+        k=base_amp[active]/reader_amp[active]
+        if coords.size==0 or not np.all(np.isfinite(k)):
+            raise ValueError('Issue 1 translation contains no valid frequency coordinates.')
+        settings={
+            'sample_rate_hz':float(reader.fs),'fft_length':ISSUE1_FFT_N,
+            'fft_overlap_percent':ISSUE1_OVERLAP*100.0,'fft_ensemble_count':ISSUE1_ENSEMBLE_COUNT,
+            'fir_hz':[ISSUE1_LOW_HZ,ISSUE1_HIGH_HZ],'fft_window':'Hann','fir_window':'Hamming',
+        }
+        return TranslationResult(
+            ISSUE1_METHOD,target_axis,coords,k,reference.source,reader.source,
+            reference_domain,source_axis,settings,
+            {'reader_ensemble_starts':reader_starts,'reference_selected_source':reference.metadata.get('selected_source','time-domain')}
+        )
+
+    def _derive_issue2_translation(self,target_axis,source_axis):
+        reader=self.reader_runs.get(target_axis) or self.reader
+        if reader is None or not reader.loaded:
+            raise ValueError(f'No {target_axis}-excited reader run is loaded.')
+        scores,rec,common,band,series,local_base=self._axis_correction_result(target_axis,source_axis)
+        reference=self.baselines[source_axis]
+        coords=np.asarray(GORDON_FC,float)
+        k=np.asarray([band[float(fc)] for fc in coords],float)
+        settings={
+            'sample_rate_hz':float(self.fs.get()),'fft_length':int(self.n.get()),'fft_window':'Hann',
+            'fft_overlap_percent':float(self.ov.get()),'psd_averages':int(self.segs.get()),
+            'gordon_band_centres_hz':[float(v) for v in GORDON_FC],
+        }
+        return TranslationResult(
+            ISSUE2_METHOD,target_axis,coords,k,reference.source,reader.source,
+            'PSD' if isinstance(reference,BaselineSpectrum) else 'time',source_axis,settings,
+            {'recommended_model':rec,'single_K_candidate':float(common),'reference_selected_source':reference.metadata.get('selected_source','time-domain')}
+        )
+
+    def derive_translation(self,target_axis=None,method=None):
+        """Authoritative translation path used by store/export for both methods."""
+        axis=(target_axis or self.driven_axis.get()).upper()
+        if axis not in 'XYZ': raise ValueError('Driven axis must be X, Y or Z.')
+        source=self._resolve_missing_baseline_mapping(axis)
+        selected=method or self.applied_processing_method
+        if selected==ISSUE1_METHOD:
+            return self._derive_issue1_translation(axis,source)
+        if selected==ISSUE2_METHOD:
+            return self._derive_issue2_translation(axis,source)
+        raise ValueError(f'Unsupported processing method: {selected}')
 
     def _write_correction_export_log(self, csv_path, rows, mappings):
         """Write a sidecar JSON that records exactly how exported K factors were generated."""
@@ -4058,9 +5385,12 @@ PSD averages: 4
             'application_title':APP_TITLE,
             'correction_csv':csv_path.name,
             'reader_source_file':Path(self.reader.source).name if self.reader.source else self.reader.label,
+            'reader_details':dict(self.reader.metadata),
             'baseline_source_files':baseline_files,
             'baseline_mapping':dict(mappings),
+            'baseline_details':{a:dict(obj.metadata) for a,obj in self.baselines.items() if obj is not None},
             'processing_settings':{
+                'processing_method':ISSUE2_METHOD,
                 'sample_rate_hz':float(self.fs.get()),
                 'fft_length':int(self.n.get()),
                 'fft_window':'Hann',
@@ -4075,61 +5405,91 @@ PSD averages: 4
         sidecar.write_text(json.dumps(payload,indent=2,ensure_ascii=False,default=str),encoding='utf-8')
         return sidecar
 
-    def export_correction(self):
-        if not self.reader.loaded:
-            messagebox.showinfo('Export correction','Load the three-axis Reader CSV first.')
-            return
-        if not any(p is not None and p.loaded for p in self.baselines.values()):
-            messagebox.showinfo('Export correction','Load at least one baseline CSV first.')
-            return
+    def _update_stored_correction_status(self):
+        parts=[]
+        for axis in 'XYZ':
+            q=self.stored_correction_axes.get(axis)
+            parts.append(f"{axis} {'stored' if q else '—'}")
+        self.stored_correction_status.set('Final XYZ correction: '+' | '.join(parts))
+
+    def store_current_axis_correction(self):
+        """Derive and retain the selected driven-axis translation for the active method."""
+        axis=self.driven_axis.get().upper()
         try:
-            mappings={}
-            for target in 'XYZ':
-                mappings[target]=self._resolve_missing_baseline_mapping(target)
+            result=self.derive_translation(axis,self.applied_processing_method)
+            rows=result.rows()
+            self.stored_correction_axes[axis]={
+                'method':result.method,
+                'result':result,
+                'rows':rows,
+                'reader_source_file':Path(result.reader_source).name if result.reader_source else '',
+                'baseline_source_axis':result.reference_axis,
+                'stored_local':time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            self._update_stored_correction_status()
+            self.status.set(f'Stored {axis}-axis {result.method} translation from the {axis}-excited reader run.')
+        except Exception as exc:
+            messagebox.showerror('Store translation',str(exc))
 
-            rows=[]
-            for target in 'XYZ':
-                source=mappings[target]
-                scores,rec,common,band,series,local_base=self._axis_correction_result(target,source)
-                source_file=Path(self.baselines[source].source).name
-                for fc in GORDON_FC:
-                    # Always export the frequency-dependent coefficient because
-                    # the live correction consumes 14 K values per axis. The
-                    # model recommendation and single-K candidate are retained
-                    # as additional engineering information.
-                    rows.append({
-                        'driven_axis':target,
-                        'baseline_source_axis':source,
-                        'fallback_used':source!=target,
-                        'baseline_source_file':source_file,
-                        'baseline_source_format':'baseline_psd' if isinstance(self.baselines[source],BaselineSpectrum) else self.baselines[source].metadata.get('source_format','time_domain'),
-                        'reader_source_file':Path(self.reader.source).name if self.reader.source else self.reader.label,
-                        'fc_hz':float(fc),
-                        'recommended_model':rec,
-                        'single_K_candidate':float(common),
-                        'K_base_over_reader':float(band[fc]),
-                    })
+    def export_stored_xyz_correction(self):
+        """Export one complete XYZ translation set; mixed processing methods are rejected."""
+        missing=[a for a in 'XYZ' if not self.stored_correction_axes.get(a)]
+        if missing:
+            messagebox.showinfo('Export final XYZ translation','Store the driven-axis translation for '+', '.join(missing)+' before final export.'); return
+        methods={self.stored_correction_axes[a].get('method') for a in 'XYZ'}
+        if len(methods)!=1:
+            messagebox.showerror('Export final XYZ translation','The stored X/Y/Z results use different processing methods. Re-derive all three using either Issue 1 or Issue 2.'); return
+        method=next(iter(methods))
+        path=filedialog.asksaveasfilename(defaultextension='.csv',filetypes=[('CSV','*.csv')],initialfile=f'1174_final_XYZ_{"issue1" if method==ISSUE1_METHOD else "issue2"}_translation.csv')
+        if not path: return
+        rows=[]
+        for axis in 'XYZ': rows.extend(self.stored_correction_axes[axis]['rows'])
+        pd.DataFrame(rows).to_csv(path,index=False)
+        sidecar=Path(path).with_name(Path(path).stem+'_settings.json')
+        axis_sources={}
+        for axis in 'XYZ':
+            result=self.stored_correction_axes[axis]['result']
+            axis_sources[axis]={
+                'method':result.method,'reference_source':result.reference_source,
+                'reader_source':result.reader_source,'reference_domain':result.reference_domain,
+                'reference_axis':result.reference_axis,'settings':result.settings,'metadata':result.metadata,
+            }
+        payload={'log_type':'1174 final XYZ vibration translation set','generated_local':time.strftime('%Y-%m-%d %H:%M:%S'),'application_title':APP_TITLE,'processing_method':method,'axis_sources':axis_sources,'coefficients':rows}
+        sidecar.write_text(json.dumps(payload,indent=2,ensure_ascii=False,default=str),encoding='utf-8')
+        self.status.set(f'Exported complete XYZ {method} translation set to {Path(path).name}.')
+        messagebox.showinfo('Final XYZ translation exported',f'Saved {len(rows)} coefficients to:\n{Path(path).name}\n\nTraceability:\n{sidecar.name}')
 
+    def export_correction(self):
+        """Export translations derivable from the currently loaded excitation slots."""
+        available=[a for a in 'XYZ' if self.reader_runs.get(a) is not None and self.reader_runs[a].loaded]
+        if not available and self.reader.loaded:
+            available=[self.driven_axis.get().upper()]
+        if not available:
+            messagebox.showinfo('Export translation','Load at least one reader characterisation run first.'); return
+        try:
+            results=[]
+            for axis in available:
+                results.append(self.derive_translation(axis,self.applied_processing_method))
             path=filedialog.asksaveasfilename(
-                defaultextension='.csv',
-                filetypes=[('CSV','*.csv')],
-                initialfile='1174_XYZ_multifrequency_vibration_correction.csv')
-            if path:
-                out=pd.DataFrame(rows)
-                out.to_csv(path,index=False)
-                settings_path=self._write_correction_export_log(path,rows,mappings)
-                fallback=[f'{t}←{s}' for t,s in mappings.items() if t!=s]
-                note=f' Fallback mapping: {", ".join(fallback)}.' if fallback else ''
-                self.status.set(f'Exported 42 multi-frequency K coefficients to {Path(path).name} with settings log {settings_path.name}.{note}')
-                messagebox.showinfo(
-                    'Correction exported',
-                    f'Saved 42 coefficients (14 bands × X/Y/Z) to:\n{Path(path).name}\n\n'
-                    f'Settings/traceability log:\n{settings_path.name}\n\n'
-                    + (f'Fallback baseline mapping used: {", ".join(fallback)}' if fallback else 'All axes used their matching baseline files.'))
-        except RuntimeError as exc:
-            self.status.set(str(exc))
-        except Exception as e:
-            messagebox.showerror('Export error',str(e))
+                defaultextension='.csv',filetypes=[('CSV','*.csv')],
+                initialfile=f'1174_{"".join(r.driven_axis for r in results)}_{"issue1" if self.applied_processing_method==ISSUE1_METHOD else "issue2"}_translation.csv')
+            if not path: return
+            rows=[]
+            for result in results: rows.extend(result.rows())
+            pd.DataFrame(rows).to_csv(path,index=False)
+            sidecar=Path(path).with_name(Path(path).stem+'_settings.json')
+            payload={
+                'log_type':'1174 vibration translation export','generated_local':time.strftime('%Y-%m-%d %H:%M:%S'),
+                'application_title':APP_TITLE,'processing_method':self.applied_processing_method,
+                'reader_details':dict(self.reader.metadata) if getattr(self.reader,'metadata',None) is not None else {},
+                'axis_sources':{r.driven_axis:{'reference_source':r.reference_source,'reader_source':r.reader_source,'reference_domain':r.reference_domain,'reference_axis':r.reference_axis,'settings':r.settings,'metadata':r.metadata} for r in results},
+                'coefficients':rows,
+            }
+            sidecar.write_text(json.dumps(payload,indent=2,ensure_ascii=False,default=str),encoding='utf-8')
+            self.status.set(f'Exported {len(rows)} {self.applied_processing_method} translation coefficients to {Path(path).name}.')
+            messagebox.showinfo('Translation exported',f'Saved {len(rows)} coefficients to:\n{Path(path).name}\n\nTraceability:\n{sidecar.name}')
+        except Exception as exc:
+            messagebox.showerror('Export translation',str(exc))
 
     def save_plot(self):
         idx=self.tabs.index(self.tabs.select()); name=self.tabs.tab(idx,'text'); f,_=self.fig[name]; path=filedialog.asksaveasfilename(defaultextension='.png',filetypes=[('PNG','*.png'),('PDF','*.pdf')]);

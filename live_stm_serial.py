@@ -83,7 +83,11 @@ def available_serial_ports() -> List[Tuple[str, str, str]]:
 
 
 class StLinkVcpSerial:
-    """Serial transport copied conceptually from firmware_tool SerialClient."""
+    """Length-prefixed ProtoComms transport over an ST-Link virtual COM port.
+
+    On the wire each frame is ``uint32 length + payload + uint32 CRC`` in
+    little-endian order. The CRC covers the encoded length and payload.
+    """
 
     def __init__(self, port: str, baudrate: int = DEFAULT_BAUD) -> None:
         self.port = port
@@ -123,6 +127,7 @@ class StLinkVcpSerial:
         self.ser = None
 
     def send_payload(self, payload: bytes) -> None:
+        """Frame and synchronously write one serialized protobuf payload."""
         if not self.is_open:
             raise RuntimeError("serial port is not connected")
         size_bytes = struct.pack("<I", len(payload))
@@ -132,6 +137,7 @@ class StLinkVcpSerial:
         self.ser.flush()
 
     def _read_exact(self, n: int, deadline: float) -> bytes:
+        """Read up to ``n`` bytes without extending the caller's deadline."""
         chunks = bytearray()
         while len(chunks) < n and time.monotonic() < deadline:
             remain = deadline - time.monotonic()
@@ -142,6 +148,7 @@ class StLinkVcpSerial:
         return bytes(chunks)
 
     def receive_payload(self, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Optional[bytes]:
+        """Read and validate one frame, returning ``None`` on an incomplete timeout."""
         if not self.is_open:
             raise RuntimeError("serial port is not connected")
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -169,7 +176,7 @@ class StLinkVcpSerial:
 
 
 class DirectStm32Client:
-    """Request/response interface over ST-Link Virtual COM."""
+    """Serialized protobuf request/response interface over ST-Link VCP."""
 
     def __init__(self) -> None:
         self.transport: Optional[StLinkVcpSerial] = None
@@ -181,6 +188,7 @@ class DirectStm32Client:
         return bool(self.transport and self.transport.is_open)
 
     def _alloc_id(self) -> int:
+        """Allocate a positive application message ID, wrapping at int32 max."""
         mid = self._next_id
         self._next_id = (self._next_id + 1) & 0x7FFFFFFF
         if self._next_id < 0xD100:
@@ -209,6 +217,7 @@ class DirectStm32Client:
 
     def _request(self, request_field: str, response_field: str,
                  timeout_ms: int = DEFAULT_TIMEOUT_MS):
+        """Send one protobuf request and wait for its correlated typed response."""
         if not self.transport:
             raise RuntimeError("not connected")
         with self._lock:
